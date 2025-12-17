@@ -2,19 +2,42 @@
 <html lang="ru">
 <head>
   <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>PDF → CSV</title>
+  <style>
+    body { font-family: Arial, sans-serif; max-width: 900px; margin: 24px auto; padding: 0 12px; }
+    .box { border: 1px solid #ddd; border-radius: 10px; padding: 16px; }
+    label { display:block; margin-top: 12px; font-weight: 600; }
+    input, select { padding: 8px; margin-top: 6px; width: 100%; }
+    button { margin-top: 16px; padding: 10px 16px; cursor: pointer; }
+    .hint { color:#666; font-size: 14px; margin-top: 8px; }
+  </style>
 </head>
-<body style="font-family: Arial; max-width: 720px; margin: 40px auto;">
-  <h2>PDF → CSV (разделитель “;”)</h2>
+<body>
+  <h2>Конвертер PDF → CSV</h2>
+  <div class="box">
+    <form action="/convert" method="post" enctype="multipart/form-data">
+      <label>PDF файл</label>
+      <input type="file" name="file" accept="application/pdf" required />
 
-  <form action="/convert" method="post" enctype="multipart/form-data">
-    <p>
-      <input type="file" name="pdf" accept="application/pdf" required />
-    </p>
-    <button type="submit">Загрузить PDF и скачать CSV</button>
-  </form>
+      <label>Разделитель CSV</label>
+      <select name="delimiter">
+        <option value=";">;</option>
+        <option value=",">,</option>
+        <option value="\t">TAB</option>
+      </select>
 
-  <hr>
-  <p>Сервис берёт список товаров из <code>data/items.xlsx</code>.</p>
+      <label>Использовать items.xlsx (для артикула/канонического имени)</label>
+      <select name="use_catalog">
+        <option value="1" selected>Да</option>
+        <option value="0">Нет (только как в PDF)</option>
+      </select>
+
+      <button type="submit">Скачать CSV</button>
+      <div class="hint">
+        Порядок строк будет как в PDF. В CSV попадут только позиции, реально найденные в PDF.
+      </div>
+    </form>
+  </div>
 </body>
 </html>
