@@ -28,7 +28,7 @@ _CODE_RE = re.compile(r"\b(g[a-z]{1,3}-?\d{2,3}|grb|grp|grc|gbm|gsh)\b", re.IGNO
 _SIZE_RE = re.compile(r"\b(\d{2,3})\s*х\s*(\d{2,3})\b", re.IGNORECASE)
 
 # строка где есть "цена за шт ... ₽  кол-во  сумма ₽"
-# ВАЖНО: НЕТ \b в конце, иначе не матчится на конце строки после "₽"
+# ВАЖНО: без \b в конце
 _QTY_LINE_RE = re.compile(r"\d+[.,]\d+\s*₽\s*(\d+)\s+[\d\s]+\s*₽")
 
 
@@ -60,12 +60,12 @@ def _make_key_from_text(text: str) -> Optional[str]:
     if not codes:
         return None
 
-    # ВАЖНО: берём ПОСЛЕДНИЙ код (для "GS-150 графит" и т.п.)
+    # берём ПОСЛЕДНИЙ код (наиболее “близкий” к товару)
     code = codes[-1]
 
     size = _pick_small_size(t)
 
-    # Для полок/корзин размер обязателен (GSh / GBM / GPd / GPs)
+    # Для размерных товаров добавляем размер в ключ
     if size and code in ("gsh", "gbm", "gpd", "gps"):
         return f"{code}:{size}"
 
@@ -142,6 +142,7 @@ def build_csv_from_pdf(pdf_bytes: bytes, items_xlsx_path: str, delimiter: str = 
     lines = _extract_lines(pdf_bytes)
 
     found_qty: Dict[str, int] = {}
+    order: List[str] = []  # порядок по PDF (первое появление)
 
     for i, raw in enumerate(lines):
         line = (raw or "").strip()
@@ -167,15 +168,18 @@ def build_csv_from_pdf(pdf_bytes: bytes, items_xlsx_path: str, delimiter: str = 
         if not key or key not in items_map:
             continue
 
+        # фиксируем порядок первого появления в PDF
+        if key not in found_qty:
+            order.append(key)
+
         found_qty[key] = found_qty.get(key, 0) + qty
 
-    # CSV: только найденные, в порядке Excel
+    # CSV: только найденные, в порядке PDF
     out = io.StringIO()
     writer = csv.writer(out, delimiter=delimiter)
     writer.writerow(["Наименование", "Кол-во"])
 
-    for key, excel_name in items_map.items():
-        if key in found_qty:
-            writer.writerow([excel_name, found_qty[key]])
+    for key in order:
+        writer.writerow([items_map[key], found_qty[key]])
 
     return out.getvalue()
