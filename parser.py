@@ -21,18 +21,34 @@ def _norm(s: str) -> str:
 
 # ---------------- РЕГЕКСЫ ----------------
 
-# коды типа GR-65 / GS-150 / GBr-40 / GFB-60 / GOV-60 / GRB / GRC / GRP / GSh / GBM ...
 _CODE_RE = re.compile(r"\b(g[a-z]{1,3}-?\d{2,3}|grb|grp|grc|gbm|gsh)\b", re.IGNORECASE)
-
-# размеры типа 60х40, 90х40, 60х20, 30х10
 _SIZE_RE = re.compile(r"\b(\d{2,3})\s*х\s*(\d{2,3})\b", re.IGNORECASE)
 
-# строка где есть "цена за шт ... ₽  кол-во  сумма ₽"
-# ВАЖНО: без \b в конце
+# строка с количеством: "290.00 ₽ 1 290 ₽"
 _QTY_LINE_RE = re.compile(r"\d+[.,]\d+\s*₽\s*(\d+)\s+[\d\s]+\s*₽")
 
 
-# ---------------- EXCEL ----------------
+# ---------------- ЦВЕТ ----------------
+
+def _extract_color(text: str) -> Optional[str]:
+    """
+    Вытаскиваем цвет/покрытие, чтобы отличать одинаковые коды.
+    Добавляй сюда новые варианты, если появятся.
+    """
+    t = _norm(text)
+
+    # важные варианты
+    if "графит" in t:
+        return "графит"
+    if "бел" in t:   # белый / белая
+        return "белый"
+    if "оцинк" in t:  # оцинк / оцинк.
+        return "оцинк"
+
+    return None
+
+
+# ---------------- КЛЮЧ ТОВАРА ----------------
 
 def _pick_small_size(text: str) -> Optional[str]:
     """
@@ -43,14 +59,9 @@ def _pick_small_size(text: str) -> Optional[str]:
     for m in _SIZE_RE.finditer(t):
         a = int(m.group(1))
         b = int(m.group(2))
-        mx = max(a, b)
-
-        # отсечка больших габаритов из строк с габаритами (650х48 и т.п.)
-        if mx > 200:
+        if max(a, b) > 200:
             continue
-
         return f"{a}х{b}"
-
     return None
 
 
@@ -60,17 +71,24 @@ def _make_key_from_text(text: str) -> Optional[str]:
     if not codes:
         return None
 
-    # берём ПОСЛЕДНИЙ код (наиболее “близкий” к товару)
-    code = codes[-1]
-
+    code = codes[-1]  # берём последний код в строке/контексте
     size = _pick_small_size(t)
+    color = _extract_color(t)
 
-    # Для размерных товаров добавляем размер в ключ
+    parts = [code]
+
+    # Для размерных товаров добавляем размер
     if size and code in ("gsh", "gbm", "gpd", "gps"):
-        return f"{code}:{size}"
+        parts.append(size)
 
-    return code
+    # Добавляем цвет (чтобы GR-65 белый и GR-65 графит не путались)
+    if color:
+        parts.append(color)
 
+    return ":".join(parts)
+
+
+# ---------------- EXCEL ----------------
 
 def _load_items(items_xlsx_path: str) -> Dict[str, str]:
     """
@@ -113,7 +131,8 @@ def _make_key_for_qty_line(lines: List[str], i: int) -> Optional[str]:
     """
     В твоём PDF код товара идёт ПОСЛЕ строки с количеством.
     Поэтому берём окно: 1 строка ДО qty и 4 строки ПОСЛЕ qty.
-    Приоритет: найти код в части "после qty" (i..i+4).
+    Приоритет: найти код в части "после qty".
+    Цвет берём из контекста (обычно рядом со строкой товара).
     """
     start = max(0, i - 1)
     end = min(len(lines), i + 5)
@@ -124,21 +143,29 @@ def _make_key_for_qty_line(lines: List[str], i: int) -> Optional[str]:
     forward_text = _norm(" ".join(forward))
     codes_fwd = [m.group(1).lower() for m in _CODE_RE.finditer(forward_text)]
 
-    if codes_fwd:
-        code = codes_fwd[0]  # первый код после qty
-        size = _pick_small_size(" ".join(ctx))
-        if size and code in ("gsh", "gbm", "gpd", "gps"):
-            return f"{code}:{size}"
-        return code
+    ctx_text = _norm(" ".join(ctx))
+    size = _pick_small_size(ctx_text)
+    color = _extract_color(ctx_text)
 
-    # запасной вариант: пробуем общий контекст
+    if codes_fwd:
+        code = codes_fwd[0]
+        parts = [code]
+
+        if size and code in ("gsh", "gbm", "gpd", "gps"):
+            parts.append(size)
+
+        if color:
+            parts.append(color)
+
+        return ":".join(parts)
+
     return _make_key_from_text(" ".join(ctx))
 
 
 # ---------------- CSV ----------------
 
 def build_csv_from_pdf(pdf_bytes: bytes, items_xlsx_path: str, delimiter: str = ";") -> str:
-    items_map = _load_items(items_xlsx_path)  # key -> excel_name
+    items_map = _load_items(items_xlsx_path)
     lines = _extract_lines(pdf_bytes)
 
     found_qty: Dict[str, int] = {}
@@ -149,7 +176,7 @@ def build_csv_from_pdf(pdf_bytes: bytes, items_xlsx_path: str, delimiter: str = 
         if not line:
             continue
 
-        # пропуски мусора/шапок
+        # мусор/шапки
         if line.startswith("Фото Товар"):
             continue
         if line.startswith("Страница:"):
@@ -168,13 +195,11 @@ def build_csv_from_pdf(pdf_bytes: bytes, items_xlsx_path: str, delimiter: str = 
         if not key or key not in items_map:
             continue
 
-        # фиксируем порядок первого появления в PDF
         if key not in found_qty:
             order.append(key)
 
         found_qty[key] = found_qty.get(key, 0) + qty
 
-    # CSV: только найденные, в порядке PDF
     out = io.StringIO()
     writer = csv.writer(out, delimiter=delimiter)
     writer.writerow(["Наименование", "Кол-во"])
