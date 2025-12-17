@@ -1,72 +1,54 @@
+import io
 import re
-from io import StringIO
+import csv
 from typing import Dict, List, Optional, Tuple
 
 import pdfplumber
 from openpyxl import load_workbook
 
 
-# --- Нормализация текста ---
-def _norm(text: str) -> str:
-    if text is None:
-        return ""
-    s = str(text).lower().replace("ё", "е").replace("\u00a0", " ")
+# ---------------- НОРМАЛИЗАЦИЯ ----------------
+
+def _norm(s: str) -> str:
+    s = "" if s is None else str(s)
+    s = s.replace("\u00a0", " ").replace("ё", "е")
+    s = s.lower()
     s = re.sub(r"\s+", " ", s).strip()
-    # приводим все варианты "x/*/×" к кириллической "х"
+    # приводим все варианты "x/×/*" к кириллической "х"
     s = s.replace("x", "х").replace("×", "х").replace("*", "х")
     return s
 
 
-# --- Регексы для ключей ---
-# Ловим коды типа GR-65, GS-150, GBr-40, GPd-30, GSd-40, GFB-60 и т.п.
+# ---------------- РЕГЕКСЫ ----------------
+
+# коды типа GR-65 / GS-150 / GBr-40 / GFB-60 / GOV-60 / GPd-30 / GSd-40 и т.п.
 _CODE_RE = re.compile(r"\b(g[a-z]{1,3}-?\d{2,3}|grb|grp|grc|gbm|gsh)\b", re.IGNORECASE)
 
-# Размеры: 60х40, 90x40, 90*40 и т.п.
-_SIZE_RE = re.compile(r"\b(\d{2,3})\s*[хx×\*]\s*(\d{2,3})\b", re.IGNORECASE)
+# размеры типа 60х40, 90х40, 60х20, 30х10 (а НЕ 650х48 и НЕ 25х1528)
+_SIZE_RE = re.compile(r"\b(\d{2,3})\s*х\s*(\d{2,3})\b", re.IGNORECASE)
 
-# Строка с количеством: "... 290.00 ₽ 1 290 ₽" (в середине — КОЛ-ВО)
-# Важно: сумма может быть с пробелами "1 290"
-_QTY_LINE_RE = re.compile(r"\d+[.,]\d+\s*₽\s*(\d+)\s+[\d\s]+\s*₽")
+# строка где есть "цена за шт", "кол-во", "сумма"
+# примеры из твоего PDF: "290.00 ₽ 1 290 ₽", "640.00 ₽ 2 1280 ₽", "220.00 ₽ 12 2640 ₽"
+_QTY_LINE_RE = re.compile(r"\b\d+[.,]\d+\s*₽\s*(\d+)\s+[\d\s]+\s*₽\b")
 
 
-def _make_key_from_text(text: str) -> Optional[str]:
-    """
-    Делаем ключ:
-      - если нашли код: берем его
-      - если нашли размер: добавляем как code:AxB (например gsh:60х40)
-    """
-    t = _norm(text)
-    mc = _CODE_RE.search(t)
-    if not mc:
-        return None
-    code = mc.group(1).lower()
-
-    ms = _SIZE_RE.search(t)
-    if ms:
-        a = int(ms.group(1))
-        b = int(ms.group(2))
-        size = f"{a}х{b}"
-        return f"{code}:{size}"
-
-    return code
-
+# ---------------- EXCEL ----------------
 
 def _load_items(items_xlsx_path: str) -> Dict[str, str]:
     """
-    Читает Excel (1 колонка: наименования).
-    Возвращает map: key -> оригинальное наименование (как в Excel).
+    Возвращает {key -> оригинальное_наименование_из_excel}
     """
     wb = load_workbook(items_xlsx_path, read_only=True, data_only=True)
     ws = wb.active
 
     items_map: Dict[str, str] = {}
-    for (val,) in ws.iter_rows(min_row=1, max_col=1, values_only=True):
-        if val is None:
+
+    for (v,) in ws.iter_rows(min_row=1, max_col=1, values_only=True):
+        if v is None:
             continue
-        name = str(val).strip()
+        name = str(v).strip()
         if not name:
             continue
-        # пропускаем заголовок если он есть
         if _norm(name) in ("наименование", "товар", "позиция"):
             continue
 
@@ -78,111 +60,115 @@ def _load_items(items_xlsx_path: str) -> Dict[str, str]:
     return items_map
 
 
-def _extract_lines_from_pdf(pdf_bytes: bytes) -> List[str]:
-    lines: List[str] = []
-    with pdfplumber.open(StringIO("")) as _:
-        pass  # просто чтобы линтер не ругался, pdfplumber реально откроем ниже
+# ---------------- КЛЮЧ ИЗ ТЕКСТА ----------------
 
-    with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
+def _pick_small_size(text: str) -> Optional[str]:
+    """
+    Берём "малый размер" (типа 60х40, 90х40, 60х20, 30х10),
+    а габариты типа 650х48 или 25х1528 игнорируем.
+    """
+    t = _norm(text)
+    for m in _SIZE_RE.finditer(t):
+        a = int(m.group(1))
+        b = int(m.group(2))
+        mx, mn = max(a, b), min(a, b)
+
+        # отсечка больших габаритов
+        if mx > 200:
+            continue
+
+        # более “товарные” размеры (по твоему ассортименту)
+        # (чтобы 178х167 из чертежей/параметров не путало)
+        if mn in (10, 20, 30, 40, 50, 60, 90, 100, 120) or mx in (10, 20, 30, 40, 50, 60, 90, 100, 120):
+            return f"{a}х{b}"
+
+        # запасной вариант: маленькие, но не совсем случайные
+        if mx <= 120 and mn <= 90:
+            return f"{a}х{b}"
+
+    return None
+
+
+def _make_key_from_text(text: str) -> Optional[str]:
+    t = _norm(text)
+    codes = [m.group(1).lower() for m in _CODE_RE.finditer(t)]
+    if not codes:
+        return None
+
+    code = codes[-1]  # ВАЖНО: берём ПОСЛЕДНИЙ код в буфере (он относится к текущей позиции)
+
+    size = _pick_small_size(t)
+    # размер нужен для "размерных" товаров (полки/корзины/разделители)
+    if size and code in ("gsh", "gbm", "gpd", "gps"):
+        return f"{code}:{size}"
+
+    return code
+
+
+# ---------------- PDF -> CSV ----------------
+
+def _extract_lines(pdf_bytes: bytes) -> List[str]:
+    lines: List[str] = []
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for page in pdf.pages:
             text = page.extract_text() or ""
             lines.extend(text.splitlines())
     return lines
 
 
-# pdfplumber требует BytesIO, поэтому импорт здесь
-from io import BytesIO
-
-
-def _is_qty_line(s: str) -> bool:
-    return bool(_QTY_LINE_RE.search(s))
-
-
-def _block_around_qty(lines: List[str], qty_idx: int, max_back: int = 7, max_fwd: int = 10) -> List[str]:
-    """
-    Собираем "блок" вокруг строки с количеством, чтобы в блок попали:
-    - название
-    - размеры/вес
-    - код
-    - цвет
-    Даже если код стоит на следующей строке (как в твоём PDF).
-    """
-    start = qty_idx
-    steps = 0
-
-    # назад: берём несколько строк, но останавливаемся на предыдущей строке с ₽ (другая позиция)
-    while start > 0 and steps < max_back:
-        prev = lines[start - 1].strip()
-        if not prev:
-            break
-        if _is_qty_line(prev):
-            break
-        # если там "кодовая" строка (GR-65/GS-150) — чаще это хвост предыдущей позиции, не лезем дальше
-        if _CODE_RE.search(_norm(prev)) and "₽" not in prev and not any(ch.isalpha() for ch in prev[:1]):
-            break
-        start -= 1
-        steps += 1
-
-    end = qty_idx
-    steps = 0
-
-    # вперёд: берём ещё строки после количества (там часто код/цвет/размер)
-    while end + 1 < len(lines) and steps < max_fwd:
-        nxt = lines[end + 1].strip()
-        if not nxt:
-            break
-        if _is_qty_line(nxt):
-            break
-        end += 1
-        steps += 1
-
-    return lines[start : end + 1]
-
-
 def build_csv_from_pdf(pdf_bytes: bytes, items_xlsx_path: str, delimiter: str = ";") -> str:
-    """
-    Главная функция:
-      - загрузить список из Excel
-      - распарсить PDF
-      - сопоставить ключи
-      - вернуть CSV (только найденные позиции)
-    """
-    items_map = _load_items(items_xlsx_path)
+    items_map = _load_items(items_xlsx_path)  # key -> excel_name
 
-    # 1) вытаскиваем все строки PDF
-    lines: List[str] = []
-    with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
-        for page in pdf.pages:
-            text = page.extract_text() or ""
-            lines.extend(text.splitlines())
+    lines = _extract_lines(pdf_bytes)
 
-    # 2) находим все qty-строки и строим найденное
-    found_qty_by_key: Dict[str, int] = {}
+    # КОПИМ БУФЕР СТРОК ОДНОГО ТОВАРА, ДО ТЕХ ПОР, ПОКА НЕ ВСТРЕТИЛИ qty-строку
+    buffer: List[str] = []
+    found_qty: Dict[str, int] = {}
 
-    for i, line in enumerate(lines):
+    for raw in lines:
+        line = (raw or "").strip()
+        if not line:
+            continue
+
+        # пропускаем мусор/шапки
+        if line.startswith("Фото Товар"):
+            buffer = []
+            continue
+        if line.startswith("Страница:"):
+            continue
+        if line in ("18995 ₽", "Общий вес", "Максимальный габарит заказа", "Адрес:", "Телефон:", "Email"):
+            continue
+
+        buffer.append(line)
+
         m = _QTY_LINE_RE.search(line)
         if not m:
             continue
+
         qty = int(m.group(1))
 
-        block = _block_around_qty(lines, i)
-        key = _make_key_from_text(" ".join(block))
+        # ключ ищем по ВСЕМУ буферу, но берём ПОСЛЕДНИЙ код (см _make_key_from_text)
+        key = _make_key_from_text(" ".join(buffer))
+
+        # очистка буфера ВСЕГДА после qty-строки — это убирает “смещение”
+        buffer = []
+
         if not key:
             continue
 
-        # ВАЖНО: выводим ТОЛЬКО то, что есть в Excel
+        # выводим ТОЛЬКО то, что есть в Excel
         if key not in items_map:
             continue
 
-        found_qty_by_key[key] = found_qty_by_key.get(key, 0) + qty
+        found_qty[key] = found_qty.get(key, 0) + qty
 
-    # 3) формируем CSV
-    out = StringIO()
-    out.write(f"Наименование{delimiter}Кол-во\n")
+    # CSV: только найденные, в порядке Excel
+    out = io.StringIO()
+    writer = csv.writer(out, delimiter=delimiter)
+    writer.writerow(["Наименование", "Кол-во"])
 
-    # порядок: как в Excel
-    for key, name in items_map.items():
-        if key in found_qty_by_key:
-            out.write(f"{name}{delimiter}{found_qty_by_key[key]}\n")
+    for key, excel_name in items_map.items():
+        if key in found_qty:
+            writer.writerow([excel_name, found_qty[key]])
 
     return out.getvalue()
