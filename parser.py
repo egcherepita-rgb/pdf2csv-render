@@ -1,60 +1,105 @@
 import io
 import re
+import csv
 import pdfplumber
 from openpyxl import load_workbook
 
-def _norm(s: str) -> str:
-    s = s.lower().replace("ё", "е")
-    s = re.sub(r"\s+", " ", s)
-    s = s.replace("\u00a0", " ").strip()
-    return s
 
-def _load_items(items_xlsx_path: str) -> list[str]:
-    wb = load_workbook(items_xlsx_path, read_only=True, data_only=True)
-    ws = wb.active  # первый лист
-    items = []
+# ----------------------------
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# ----------------------------
 
-    # читаем только первую колонку (A)
-    for row in ws.iter_rows(min_row=1, max_col=1, values_only=True):
-        v = row[0]
-        if v is None:
+def _norm(text: str) -> str:
+    if not text:
+        return ""
+    text = text.lower().replace("ё", "е")
+    text = text.replace("\u00a0", " ")
+    text = re.sub(r"\s+", " ", text)
+    text = text.replace("x", "х").replace("×", "х")
+    return text.strip()
+
+
+def _make_key(text: str) -> str | None:
+    """
+    Делает ключ вида:
+    - gr-65
+    - gs-200
+    - gfb-60
+    - gsh:60х40
+    """
+    t = _norm(text)
+
+    # код изделия
+    m_code = re.search(r"\b(g[a-z]{1,3}-?\d{2,3}|grb|grp|grc|gbm|gsh)\b", t)
+    if not m_code:
+        return None
+    code = m_code.group(1)
+
+    # размер (если есть)
+    m_size = re.search(r"\b(\d{2,3}х\d{2,3})\b", t)
+    if m_size:
+        return f"{code}:{m_size.group(1)}"
+
+    return code
+
+
+# ----------------------------
+# ЗАГРУЗКА EXCEL
+# ----------------------------
+
+def _load_items(xlsx_path: str) -> dict:
+    """
+    Загружает Excel и возвращает:
+    { key -> оригинальное_название }
+    """
+    wb = load_workbook(xlsx_path, read_only=True, data_only=True)
+    ws = wb.active
+
+    items = {}
+
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        name = str(row[0]).strip()
+        if not name:
             continue
-        s = str(v).strip()
-        if s:
-            items.append(s)
+
+        key = _make_key(name)
+        if key:
+            items[key] = name
 
     wb.close()
     return items
 
-def _extract_product_blocks_from_text(lines: list[str]) -> list[tuple[str, int]]:
+
+# ----------------------------
+# ПАРСИНГ PDF
+# ----------------------------
+
+def _extract_blocks(lines: list[str]) -> list[tuple[str, int]]:
     """
-    Склеиваем строки товара до строки с ценой/кол-вом/суммой.
-    Кол-во обычно стоит после символа ₽:
-    "... 290.00 ₽ 1 290 ₽"
+    Возвращает список:
+    [(название, количество)]
     """
     blocks = []
-    buf = []
+    buffer = []
 
-    qty_line_re = re.compile(r"₽\s+(\d+)\s+\d")  # ловим qty после "₽"
+    qty_re = re.compile(r"\b\d+[.,]\d+\s*₽\s*(\d+)\s+\d+\s*₽")
 
-    for raw in lines:
-        line = (raw or "").strip()
+    for line in lines:
+        line = line.strip()
         if not line:
             continue
 
-        # заголовки/мусор
-        if line.startswith("Фото Товар") or line.startswith("Страница:"):
+        if line.startswith("Фото Товар"):
             continue
 
-        buf.append(line)
+        buffer.append(line)
 
-        m = qty_line_re.search(line)
+        m = qty_re.search(line)
         if m:
             qty = int(m.group(1))
 
             name_parts = []
-            for x in buf:
-                # стоп-слова/строки, после которых обычно начинается тех. инфа/цены
+            for x in buffer:
                 if "₽" in x:
                     break
                 name_parts.append(x)
@@ -63,56 +108,49 @@ def _extract_product_blocks_from_text(lines: list[str]) -> list[tuple[str, int]]
             if name:
                 blocks.append((name, qty))
 
-            buf = []
+            buffer = []
 
     return blocks
 
-def build_csv_from_pdf(pdf_bytes: bytes, items_xlsx_path: str, delimiter: str = ";") -> str:
-    items = _load_items(items_xlsx_path)
-    items_norm = [_norm(x) for x in items]
 
-    # читаем весь текст PDF
-    all_lines = []
+# ----------------------------
+# ГЛАВНАЯ ФУНКЦИЯ
+# ----------------------------
+
+def build_csv_from_pdf(
+    pdf_bytes: bytes,
+    items_xlsx_path: str,
+    delimiter: str = ";"
+) -> str:
+
+    items = _load_items(items_xlsx_path)
+    result: dict[str, int] = {}
+
+    # читаем PDF
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        lines = []
         for page in pdf.pages:
             text = page.extract_text() or ""
-            all_lines.extend(text.splitlines())
+            lines.extend(text.split("\n"))
 
-    blocks = _extract_product_blocks_from_text(all_lines)
-
-    # считаем количества по списку из Excel
-    counts = {item: 0 for item in items}
+    blocks = _extract_blocks(lines)
 
     for found_name, qty in blocks:
-        fn = _norm(found_name)
+        key = _make_key(found_name)
+        if not key:
+            continue
 
-        # 1) пробуем сопоставить по коду типа GR-65 / GS-200 и т.п.
-        code = None
-        m = re.search(r"\b([A-Za-zА-Яа-я]{1,4}-?\d{2,3})\b", found_name)
-        if m:
-            code = _norm(m.group(1))
+        if key in items:
+            name = items[key]
+            result[name] = result.get(name, 0) + qty
 
-        matched_idx = None
+    # формируем CSV
+    output = io.StringIO()
+    writer = csv.writer(output, delimiter=delimiter)
+    writer.writerow(["Наименование", "Кол-во"])
 
-        if code:
-            for i, itn in enumerate(items_norm):
-                if code in itn:
-                    matched_idx = i
-                    break
+    for name, qty in result.items():
+        if qty > 0:
+            writer.writerow([name, qty])
 
-        # 2) запасной вариант: по подстроке названия
-        if matched_idx is None:
-            for i, itn in enumerate(items_norm):
-                if itn and itn in fn:
-                    matched_idx = i
-                    break
-
-        if matched_idx is not None:
-            counts[items[matched_idx]] += qty
-
-    # CSV
-    out = io.StringIO()
-    out.write(f"Наименование{delimiter}Кол-во\n")
-    for item in items:
-        out.write(f"{item}{delimiter}{counts[item]}\n")
-    return out.getvalue()
+    return output.getvalue()
