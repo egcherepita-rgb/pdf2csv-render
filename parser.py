@@ -1,240 +1,232 @@
+# parser.py
+from __future__ import annotations
+
 import io
 import re
-import csv
-from typing import Dict, List, Optional
+from dataclasses import dataclass
+from typing import Dict, List, Tuple
 
 import pdfplumber
 from openpyxl import load_workbook
 
 
-# ---------------- НОРМАЛИЗАЦИЯ ----------------
+# -------------------------
+# Helpers
+# -------------------------
+
+_WS_RE = re.compile(r"\s+")
+
 
 def _norm(s: str) -> str:
-    s = "" if s is None else str(s)
-    s = s.replace("\u00a0", " ").replace("ё", "е")
-    s = s.lower()
-    s = re.sub(r"\s+", " ", s).strip()
-    # приводим все варианты x/×/* к кириллической "х"
-    s = s.replace("x", "х").replace("×", "х").replace("*", "х")
+    """Нормализация строки для сравнения."""
+    s = (s or "").strip()
+    s = _WS_RE.sub(" ", s)
     return s
 
 
-def _norm_code(code: str) -> str:
+def _is_int(s: str) -> bool:
+    return bool(re.fullmatch(r"\d+", (s or "").strip()))
+
+
+def _group_lines(words: List[dict], y_tol: float = 2.5) -> List[dict]:
     """
-    Нормализуем код:
-    - приводим к lower
-    - кириллическую 'с' внутри кода заменяем на латинскую 'c'
-      (чтобы GFBс-60 совпадал с GFBc-60 / GFBс-60 из Excel/PDF).
+    Группируем слова в "строки" по координате top.
+    words: элементы из pdfplumber.extract_words()
     """
-    c = _norm(code)
-    c = c.replace("с", "c")  # важно: кириллическая 'с'
-    return c
+    ws = sorted(words, key=lambda w: (w["top"], w["x0"]))
+    lines: List[dict] = []
 
+    for w in ws:
+        y = float(w["top"])
+        placed = False
+        for line in lines:
+            if abs(line["y"] - y) <= y_tol:
+                line["words"].append(w)
+                # пересчитать усреднённый y
+                n = len(line["words"])
+                line["y"] = (line["y"] * (n - 1) + y) / n
+                placed = True
+                break
+        if not placed:
+            lines.append({"y": y, "words": [w]})
 
-# ---------------- РЕГЕКСЫ ----------------
-# Расширили список кодов под твой PDF:
-# GR-126, GS-50, GS-200, GS-230
-# GBr-40, GBr-50, GRB, GRBn, GRP
-# GBrW-50, GFB-60, GFBc-60 (и GFBс-60), GOV-60
-# GSh, GShW, GBM, GHB-30, GP (без цифр, но с размером 60х40)
-_CODE_RE = re.compile(
-    r"\b("
-    r"gr-\d{2,3}"
-    r"|gs-\d{2,3}"
-    r"|gbrw-\d{2,3}"
-    r"|gbrn"
-    r"|gbr-\d{2,3}"
-    r"|grb"
-    r"|grbn"
-    r"|grp"
-    r"|gbm"
-    r"|gshw"
-    r"|gsh"
-    r"|gfb[сc]?-\d{2,3}"
-    r"|gov-\d{2,3}"
-    r"|ghb-\d{2,3}"
-    r"|gp"
-    r")\b",
-    re.IGNORECASE
-)
+    for line in lines:
+        line["words"] = sorted(line["words"], key=lambda w: w["x0"])
 
-_SIZE_RE = re.compile(r"\b(\d{2,3})\s*х\s*(\d{2,3})\b", re.IGNORECASE)
-
-# строка с количеством: "450.00 ₽ 1 450 ₽"
-_QTY_LINE_RE = re.compile(r"\d+[.,]\d+\s*₽\s*(\d+)\s+[\d\s]+\s*₽")
-
-
-# ---------------- ЦВЕТ ----------------
-
-def _extract_color(text: str) -> Optional[str]:
-    t = _norm(text)
-    if "графит" in t:
-        return "графит"
-    if "бел" in t:
-        return "белый"
-    if "оцинк" in t:
-        return "оцинк"
-    return None
-
-
-# ---------------- РАЗМЕР ----------------
-
-def _pick_small_size(text: str) -> Optional[str]:
-    """
-    Берём "малый размер" типа 60х40, 60х20, 60х50.
-    Большие габариты типа 1260х48, 25х2008 и т.п. игнорируем.
-    """
-    t = _norm(text)
-    for m in _SIZE_RE.finditer(t):
-        a = int(m.group(1))
-        b = int(m.group(2))
-        if max(a, b) > 200:
-            continue
-        return f"{a}х{b}"
-    return None
-
-
-# ---------------- КЛЮЧ ТОВАРА ----------------
-
-def _make_key(code: str, ctx_text: str) -> str:
-    code = _norm_code(code)
-    size = _pick_small_size(ctx_text)
-    color = _extract_color(ctx_text)
-
-    parts = [code]
-
-    # для размерных позиций добавляем размер:
-    # - GSh, GShW, GBM, GP обычно с 60х40/60х50/60х20
-    if size and code in ("gsh", "gshw", "gbm", "gp"):
-        parts.append(size)
-
-    # добавляем цвет, если есть
-    if color:
-        parts.append(color)
-
-    return ":".join(parts)
-
-
-def _make_key_from_text(text: str) -> Optional[str]:
-    t = _norm(text)
-    codes = [m.group(1) for m in _CODE_RE.finditer(t)]
-    if not codes:
-        return None
-    # если в строке несколько кодов, берём последний
-    code = codes[-1]
-    return _make_key(code, t)
-
-
-# ---------------- EXCEL ----------------
-
-def _load_items(items_xlsx_path: str) -> Dict[str, str]:
-    """
-    Возвращает {key -> оригинальное_наименование_из_excel}
-    """
-    wb = load_workbook(items_xlsx_path, read_only=True, data_only=True)
-    ws = wb.active
-
-    items_map: Dict[str, str] = {}
-
-    for (v,) in ws.iter_rows(min_row=1, max_col=1, values_only=True):
-        if v is None:
-            continue
-        name = str(v).strip()
-        if not name:
-            continue
-        if _norm(name) in ("наименование", "товар", "позиция"):
-            continue
-
-        key = _make_key_from_text(name)
-        if key:
-            items_map[key] = name
-
-    wb.close()
-    return items_map
-
-
-# ---------------- PDF ----------------
-
-def _extract_lines(pdf_bytes: bytes) -> List[str]:
-    lines: List[str] = []
-    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        for page in pdf.pages:
-            text = page.extract_text() or ""
-            lines.extend(text.splitlines())
+    lines = sorted(lines, key=lambda l: l["y"])
     return lines
 
 
-def _find_code_near_qty(lines: List[str], i: int) -> Optional[str]:
+# -------------------------
+# Items.xlsx loader (openpyxl)
+# -------------------------
+
+def _load_items(items_xlsx_path: str) -> Dict[str, str]:
     """
-    В твоём PDF код товара может быть:
-    - до строки с ценой/кол-вом
-    - или после неё (поэтому смотрим и вперёд, и назад)
+    Загружаем список допустимых наименований из items.xlsx (1-я колонка, 1-й лист).
+    Возвращаем dict: norm_name -> original_name
     """
-    start = max(0, i - 4)
-    end = min(len(lines), i + 6)
-    ctx = " ".join(lines[start:end])
-    ctx_n = _norm(ctx)
+    wb = load_workbook(items_xlsx_path, read_only=True, data_only=True)
+    ws = wb.worksheets[0]
 
-    codes = [m.group(1) for m in _CODE_RE.finditer(ctx_n)]
-    if not codes:
-        return None
-    # как правило, нужный код ближе к qty → берём последний найденный
-    return codes[-1]
-
-
-# ---------------- CSV ----------------
-
-def build_csv_from_pdf(pdf_bytes: bytes, items_xlsx_path: str, delimiter: str = ";") -> str:
-    items_map = _load_items(items_xlsx_path)
-    lines = _extract_lines(pdf_bytes)
-
-    found_qty: Dict[str, int] = {}
-    order: List[str] = []  # порядок как в PDF (первое появление)
-
-    for i, raw in enumerate(lines):
-        line = (raw or "").strip()
-        if not line:
+    out: Dict[str, str] = {}
+    for row in ws.iter_rows(min_row=1, max_col=1, values_only=True):
+        val = row[0]
+        if val is None:
             continue
-
-        # шапки/мусор
-        if line.startswith("Фото Товар"):
+        name = _norm(str(val))
+        if not name:
             continue
-        if line.startswith("Страница:"):
+        out[_norm(name)] = name
+
+    return out
+
+
+# -------------------------
+# PDF row extraction by columns
+# -------------------------
+
+@dataclass
+class PdfRow:
+    name: str
+    qty: int
+    y: float
+
+
+def _page_has_table(page) -> bool:
+    """
+    Считаем страницу "товарной", если есть слово 'Товар' (заголовок таблицы).
+    """
+    try:
+        text = page.extract_text() or ""
+    except Exception:
+        return False
+    return "Товар" in text
+
+
+def _extract_rows_from_page(
+    page,
+    *,
+    name_x: Tuple[float, float] = (70.0, 250.0),
+    qty_x: Tuple[float, float] = (440.0, 505.0),
+    y_tol: float = 2.5,
+) -> List[PdfRow]:
+    """
+    Достаём строки (наименование + количество) со страницы PDF по координатам колонок.
+    """
+    words = page.extract_words(keep_blank_chars=False, use_text_flow=True) or []
+    if not words:
+        return []
+
+    # отрежем шапку до строки с "Товар"
+    header_cut = 0.0
+    for w in words:
+        if w.get("text") == "Товар":
+            header_cut = float(w.get("bottom", w.get("top", 0.0))) + 2.0
+            break
+
+    data_words = [w for w in words if float(w.get("top", 0.0)) > header_cut]
+    if not data_words:
+        return []
+
+    lines = _group_lines(data_words, y_tol=y_tol)
+
+    # найдём "числовые" линии, где в колонке кол-ва стоит целое число
+    qty_lines: List[Tuple[float, int]] = []
+    for line in lines:
+        qty_tokens = [
+            w for w in line["words"]
+            if qty_x[0] <= float(w["x0"]) <= qty_x[1] and _is_int(w.get("text", ""))
+        ]
+        if qty_tokens:
+            qty_lines.append((float(line["y"]), int(qty_tokens[0]["text"])))
+
+    if not qty_lines:
+        return []
+
+    ys = [y for y, _q in qty_lines]
+    rows: List[PdfRow] = []
+
+    # Окно строки: между серединами соседних qty-линий (чтобы захватить переносы + цвет)
+    for i, (y, q) in enumerate(qty_lines):
+        y_prev = ys[i - 1] if i > 0 else (y - 60.0)
+        y_next = ys[i + 1] if i + 1 < len(ys) else (y + 60.0)
+
+        top = (y_prev + y) / 2.0
+        bottom = (y + y_next) / 2.0
+
+        band_words = [
+            w for w in data_words
+            if (top - 1.0) <= float(w["top"]) <= (bottom + 1.0)
+            and name_x[0] <= float(w["x0"]) <= name_x[1]
+        ]
+        band_words = sorted(band_words, key=lambda w: (w["top"], w["x0"]))
+
+        name = _norm(" ".join(w.get("text", "") for w in band_words))
+        if name:
+            rows.append(PdfRow(name=name, qty=q, y=y))
+
+    return rows
+
+
+def _extract_rows_from_pdf(pdf_bytes: bytes) -> List[PdfRow]:
+    """
+    Собираем строки со всех страниц PDF (только со страниц с таблицей "Товар").
+    """
+    rows: List[PdfRow] = []
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        for page in pdf.pages:
+            if not _page_has_table(page):
+                continue
+            rows.extend(_extract_rows_from_page(page))
+    return rows
+
+
+# -------------------------
+# Public API
+# -------------------------
+
+def build_csv_from_pdf(
+    *,
+    pdf_bytes: bytes,
+    items_xlsx_path: str,
+    delimiter: str = ";",
+    include_header: bool = True,
+) -> str:
+    """
+    Строит CSV:
+    - берём строки из PDF в порядке появления
+    - фильтруем по items.xlsx (только то, что есть в списке)
+    - суммируем количества, если один и тот же товар встретился несколько раз
+    - порядок сохраняем как в PDF (по первому появлению)
+    """
+    allowed = _load_items(items_xlsx_path)  # norm -> original
+    pdf_rows = _extract_rows_from_pdf(pdf_bytes)
+
+    # accumulator с сохранением порядка
+    order: List[str] = []          # norm_name в порядке первого появления
+    qty_map: Dict[str, int] = {}   # norm_name -> total qty
+
+    for r in pdf_rows:
+        key = _norm(r.name)
+        if key not in allowed:
+            # Если товара нет в items.xlsx — не выводим вообще
             continue
-        if line in ("Общий вес", "Максимальный габарит заказа", "Адрес:", "Телефон:", "Email"):
-            continue
-
-        m = _QTY_LINE_RE.search(line)
-        if not m:
-            continue
-
-        qty = int(m.group(1))
-
-        # контекст вокруг qty (чтобы взять цвет/размер)
-        start = max(0, i - 4)
-        end = min(len(lines), i + 6)
-        ctx_text = _norm(" ".join(lines[start:end]))
-
-        code = _find_code_near_qty(lines, i)
-        if not code:
-            continue
-
-        key = _make_key(code, ctx_text)
-
-        # выводим ТОЛЬКО то, что есть в Excel
-        if key not in items_map:
-            continue
-
-        if key not in found_qty:
+        if key not in qty_map:
+            qty_map[key] = 0
             order.append(key)
+        qty_map[key] += int(r.qty)
 
-        found_qty[key] = found_qty.get(key, 0) + qty
-
-    out = io.StringIO()
-    writer = csv.writer(out, delimiter=delimiter)
-    writer.writerow(["Наименование", "Кол-во"])
+    lines: List[str] = []
+    if include_header:
+        lines.append(delimiter.join(["Наименование", "Количество"]))
 
     for key in order:
-        writer.writerow([items_map[key], found_qty[key]])
+        name = allowed[key]
+        qty = qty_map.get(key, 0)
+        # нули обычно не нужны, но на всякий случай
+        if qty <= 0:
+            continue
+        lines.append(delimiter.join([name, str(qty)]))
 
-    return out.getvalue()
+    return "\n".join(lines) + "\n"
