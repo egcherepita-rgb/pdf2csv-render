@@ -5,22 +5,20 @@ import pdfplumber
 from thefuzz import fuzz, process
 
 def _norm(s: str) -> str:
-    # Нормализуем: убираем лишнее, заменяем кириллицу на похожую латиницу
+    # Нормализуем ТОЛЬКО коды и размеры, цвет оставляем как есть
     replacements = {
         'х': 'x', 'Х': 'X',
         'с': 'c', 'С': 'C',
+        'р': 'g', 'Р': 'G',  # CR → GR
         'о': 'o', 'О': 'O',
         'а': 'a', 'А': 'A',
         'е': 'e', 'Е': 'E',
-        'р': 'p', 'Р': 'P',  # для CR → GR
         'ё': 'e'
     }
     for rus, lat in replacements.items():
         s = s.replace(rus, lat)
     s = s.lower()
-    s = re.sub(r"\s+", " ", s)
-    s = re.sub(r"[^\w\s-]", "", s)  # убираем лишние символы
-    s = s.strip()
+    s = re.sub(r"\s+", " ", s).strip()
     return s
 
 def _load_items(items_xlsx_path: str) -> list[str]:
@@ -75,9 +73,9 @@ def build_csv_from_pdf(pdf_bytes: bytes, items_xlsx_path: str, delimiter: str = 
     counts = {item: 0 for item in items}
     for found_name, qty in data:
         norm_found = _norm(found_name)
-        # Ищем лучшее совпадение (порог 85%)
+        # Ищем лучшее совпадение с высоким порогом
         best_match, score = process.extractOne(norm_found, items_norm, scorer=fuzz.token_sort_ratio)
-        if score >= 85:  # можно снизить до 80, если нужно больше гибкости
+        if score >= 90:
             original_item = item_map[best_match]
             counts[original_item] += qty
 
