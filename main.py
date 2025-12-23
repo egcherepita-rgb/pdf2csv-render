@@ -8,7 +8,7 @@ from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import Response, HTMLResponse
 
 
-app = FastAPI(title="PDF → CSV (товар / кол-во)", version="1.2.0")
+app = FastAPI(title="PDF → CSV (товар / кол-во)", version="1.3.0")
 
 
 # -------------------------
@@ -21,11 +21,7 @@ def normalize_text(text: str) -> str:
     return text.strip()
 
 
-def find_first_word(words: list, target: str) -> Optional[tuple]:
-    """
-    Ищем слово (токен) в words (page.get_text("words")).
-    Возвращаем первый найденный токен: (x0,y0,x1,y1,word,block,line,word_no)
-    """
+def find_word(words: list, target: str) -> Optional[tuple]:
     t = target.lower()
     for w in words:
         if (w[4] or "").lower() == t:
@@ -33,37 +29,38 @@ def find_first_word(words: list, target: str) -> Optional[tuple]:
     return None
 
 
-def table_layout_from_header(words: list) -> Optional[dict]:
+def layout_from_header(words: list) -> Optional[dict]:
     """
-    На странице ищем шапку таблицы:
-    "Товар", "Габариты", "Кол-во", "Сумма"
-    Если нашлась — возвращаем координаты колонок и нижнюю границу шапки.
+    Ищем шапку таблицы:
+    Фото | Товар | Габариты | Вес | Цена | Кол-во | Сумма
+    Нам нужны: Фото, Товар, Габариты, Кол-во, Сумма
+    Возвращаем X-границы колонок + нижнюю границу шапки.
     """
-    w_tovar = find_first_word(words, "Товар")
-    w_gab = find_first_word(words, "Габариты")
-    w_qty = find_first_word(words, "Кол-во")
-    w_sum = find_first_word(words, "Сумма")
+    w_foto = find_word(words, "Фото")
+    w_tovar = find_word(words, "Товар")
+    w_gab = find_word(words, "Габариты")
+    w_qty = find_word(words, "Кол-во")
+    w_sum = find_word(words, "Сумма")
 
-    if not (w_tovar and w_gab and w_qty and w_sum):
+    if not (w_foto and w_tovar and w_gab and w_qty and w_sum):
         return None
 
-    header_bottom = max(w_tovar[3], w_gab[3], w_qty[3], w_sum[3])
+    header_bottom = max(w_foto[3], w_tovar[3], w_gab[3], w_qty[3], w_sum[3])
 
-    # Границы колонок по X:
-    # Название товара: между "Товар" и "Габариты"
-    name_left = w_tovar[0] - 2
-    name_right = w_gab[0] - 2
+    # ВАЖНО: колонка "Товар" реально начинается НЕ с x0("Товар"),
+    # а примерно сразу после колонки "Фото".
+    # Берём левую границу как конец слова "Фото" + небольшой отступ.
+    name_left = float(w_foto[2]) + 6.0
+    name_right = float(w_gab[0]) - 6.0
 
-    # Кол-во: между "Кол-во" и "Сумма"
-    qty_left = w_qty[0] - 2
-    qty_right = w_sum[0] - 2
+    qty_left = float(w_qty[0]) - 3.0
+    qty_right = float(w_sum[0]) - 6.0
 
-    # На всякий случай, если PDF чуть “плывёт”
     if name_right <= name_left or qty_right <= qty_left:
         return None
 
     return {
-        "header_bottom": header_bottom,
+        "header_bottom": float(header_bottom),
         "name_left": name_left,
         "name_right": name_right,
         "qty_left": qty_left,
@@ -71,67 +68,59 @@ def table_layout_from_header(words: list) -> Optional[dict]:
     }
 
 
-def extract_items_from_page(page: fitz.Page) -> List[Tuple[str, int]]:
+def extract_items_from_page(page: fitz.Page, layout: dict, header_is_present: bool) -> List[Tuple[str, int]]:
     """
-    Извлекаем товары только из таблицы (если есть шапка).
+    Извлекаем товары из страницы по заданной разметке.
+    header_is_present=True -> игнорируем всё выше header_bottom
+    header_is_present=False -> header_bottom считаем 0 (страница-продолжение)
     """
     words = page.get_text("words")
     if not words:
         return []
 
-    layout = table_layout_from_header(words)
-    if layout is None:
-        # Нет шапки таблицы -> это не страница со списком товаров
-        return []
-
-    header_bottom = layout["header_bottom"]
+    header_bottom = layout["header_bottom"] if header_is_present else 0.0
     name_left, name_right = layout["name_left"], layout["name_right"]
     qty_left, qty_right = layout["qty_left"], layout["qty_right"]
 
-    # 1) Находим числа в колонке "Кол-во" НИЖЕ шапки
-    qty_words = []
+    # 1) числа в колонке Кол-во (строго по X) и ниже шапки (если она есть)
+    qty_cells = []
     for w in words:
-        txt = w[4] or ""
-        if not re.fullmatch(r"\d+", txt):
+        s = w[4] or ""
+        if not re.fullmatch(r"\d+", s):
             continue
 
-        x0, y0, x1, y1 = w[0], w[1], w[2], w[3]
+        x0, y0, x1, y1 = float(w[0]), float(w[1]), float(w[2]), float(w[3])
         if y0 <= header_bottom + 1:
             continue
         if not (qty_left <= x0 <= qty_right):
             continue
 
-        qty = int(txt)
-        # фильтр от мусора: в проектах кол-во обычно не тысячи
-        if 1 <= qty <= 500:
-            qty_words.append((x0, y0, x1, y1, qty))
+        q = int(s)
 
-    if not qty_words:
+        # Защита от "итого 42869" и прочих больших чисел
+        if 1 <= q <= 500:
+            qty_cells.append((x0, y0, x1, y1, q))
+
+    if not qty_cells:
         return []
 
-    # Сортировка сверху вниз
-    qty_words.sort(key=lambda t: (t[1], t[0]))
-
-    # 2) Строим "строки" по Y вокруг каждого qty
-    y_centers = [(q[1] + q[3]) / 2 for q in qty_words]
+    qty_cells.sort(key=lambda t: (t[1], t[0]))
+    y_centers = [(q[1] + q[3]) / 2 for q in qty_cells]
 
     items: List[Tuple[str, int]] = []
 
-    for i, q in enumerate(qty_words):
+    for i, q in enumerate(qty_cells):
         y = y_centers[i]
 
-        # границы строки — середина между соседними количествами
         top = (y_centers[i - 1] + y) / 2 if i > 0 else (header_bottom + 2)
-        bottom = (y + y_centers[i + 1]) / 2 if i < len(y_centers) - 1 else (y + 120)
+        bottom = (y + y_centers[i + 1]) / 2 if i < len(y_centers) - 1 else (y + 140)
 
-        # top не должен заходить на шапку
         top = max(top, header_bottom + 2)
 
-        # 3) Собираем название товара строго из колонки "Товар"
+        # 2) собираем название товара в той же "строке" по Y и в колонке "Товар" по X
         name_words = []
         for w in words:
-            txt = w[4] or ""
-            x0, y0, x1, y1 = w[0], w[1], w[2], w[3]
+            x0, y0, x1, y1 = float(w[0]), float(w[1]), float(w[2]), float(w[3])
             yc = (y0 + y1) / 2
 
             if yc < top or yc > bottom:
@@ -146,11 +135,17 @@ def extract_items_from_page(page: fitz.Page) -> List[Tuple[str, int]]:
         name_words.sort(key=lambda w: (w[1], w[0]))
         name = normalize_text(" ".join(w[4] for w in name_words))
 
-        # доп. чистка от случайных прилипаний
+        # Чистка от случайных заголовков, если что-то прилипло
         name = re.sub(r"^Фото\s*", "", name, flags=re.IGNORECASE).strip()
         name = re.sub(r"^Товар\s*", "", name, flags=re.IGNORECASE).strip()
 
+        # Отсекаем мусорные строки, которые теоретически могут попасть в колонку
+        low = name.lower()
         if not name:
+            continue
+        if "стоимость проекта" in low or "развертка стены" in low:
+            continue
+        if low in {"фото", "товар"}:
             continue
 
         items.append((name, q[4]))
@@ -160,10 +155,28 @@ def extract_items_from_page(page: fitz.Page) -> List[Tuple[str, int]]:
 
 def extract_items_from_pdf(pdf_bytes: bytes) -> List[Tuple[str, int]]:
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+
     aggregated = defaultdict(int)
+    current_layout = None
 
     for page in doc:
-        for name, qty in extract_items_from_page(page):
+        words = page.get_text("words")
+        if not words:
+            continue
+
+        header_layout = layout_from_header(words)
+
+        if header_layout is not None:
+            # нашли шапку -> обновляем layout и парсим страницу как страницу с шапкой
+            current_layout = header_layout
+            page_items = extract_items_from_page(page, current_layout, header_is_present=True)
+        else:
+            # шапки нет -> если layout уже был (страница-продолжение), парсим по нему
+            if current_layout is None:
+                continue
+            page_items = extract_items_from_page(page, current_layout, header_is_present=False)
+
+        for name, qty in page_items:
             aggregated[name] += qty
 
     return sorted(aggregated.items(), key=lambda x: x[0].lower())
@@ -294,42 +307,4 @@ def home():
       a.href = url;
       a.download = filename;
       document.body.appendChild(a);
-      a.click();
-      a.remove();
-      URL.revokeObjectURL(url);
-
-      setOk("Готово! CSV скачан: " + filename);
-    } catch (e) {
-      setErr(String(e.message || e));
-    } finally {
-      btn.disabled = !(input.files && input.files[0]);
-    }
-  });
-</script>
-</body>
-</html>
-"""
-
-
-@app.post("/extract", summary="Загрузить PDF и получить CSV (cp1251, ';')")
-async def extract(file: UploadFile = File(...)):
-    if not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Загрузите PDF файл (.pdf).")
-
-    pdf_bytes = await file.read()
-
-    try:
-        rows = extract_items_from_pdf(pdf_bytes)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Не удалось распарсить PDF: {e}")
-
-    if not rows:
-        raise HTTPException(status_code=422, detail="Не удалось найти таблицу товаров (шапку 'Товар/Габариты/Кол-во/Сумма').")
-
-    csv_bytes = make_csv_cp1251(rows)
-
-    return Response(
-        content=csv_bytes,
-        media_type="text/csv; charset=windows-1251",
-        headers={"Content-Disposition": 'attachment; filename="items.csv"'},
-    )
+      a.cli
