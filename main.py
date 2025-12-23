@@ -5,163 +5,131 @@ from typing import List, Tuple
 
 import fitz  # PyMuPDF
 from fastapi import FastAPI, File, UploadFile, HTTPException
-from fastapi.responses import Response
+from fastapi.responses import Response, HTMLResponse
 
 
-app = FastAPI(title="PDF → CSV (товар/кол-во)", version="1.0.0")
+app = FastAPI(
+    title="PDF → CSV (товар / кол-во)",
+    version="1.0.0"
+)
 
 
-def _normalize_text(s: str) -> str:
-    s = s.replace("\u00a0", " ")
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
+# -------------------------
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# -------------------------
+
+def normalize_text(text: str) -> str:
+    text = text.replace("\u00a0", " ")
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
 
 
-def _choose_qty_x(words: List[tuple]) -> float | None:
+def detect_qty_column_x(words: list) -> float | None:
     """
-    Находим X-позицию колонки "Кол-во" автоматически:
-    берем все чисто-числовые слова и ищем наиболее частую координату x0.
-    В таблице обычно две самые частые x0 среди чисел — это "Кол-во" и "Сумма".
-    "Кол-во" левее, поэтому берем min из топ-2.
+    Автоматически определяем X-координату колонки 'Кол-во'
+    Берём наиболее частую координату чисел
     """
     digit_words = [w for w in words if re.fullmatch(r"\d+", w[4] or "")]
     if not digit_words:
         return None
 
-    xs = [round(w[0], 1) for w in digit_words]  # x0
-    top = Counter(xs).most_common(2)
-    if not top:
+    xs = [round(w[0], 1) for w in digit_words]
+    most_common = Counter(xs).most_common(2)
+    if not most_common:
         return None
 
-    # две самые частые колонки чисел: qty и sum
-    qty_x = min(x for x, _ in top)
-    return qty_x
+    # колонка количества обычно левее колонки суммы
+    return min(x for x, _ in most_common)
 
 
-def _extract_items_from_page(page: fitz.Page) -> List[Tuple[str, int]]:
-    """
-    Возвращает список (товар, кол-во) с одной страницы.
-    Строим "якоря" по колонке Кол-во (координата x0),
-    а товар собираем слева в соответствующем вертикальном диапазоне.
-    """
-    words = page.get_text("words")  # (x0,y0,x1,y1,word,block,line,word_no)
+def extract_from_page(page: fitz.Page) -> List[Tuple[str, int]]:
+    words = page.get_text("words")
     if not words:
         return []
 
-    qty_x = _choose_qty_x(words)
+    qty_x = detect_qty_column_x(words)
     if qty_x is None:
         return []
 
-    # anchors: числа именно из колонки "Кол-во" (по x0 с допуском)
-    digit_words = [w for w in words if re.fullmatch(r"\d+", w[4] or "")]
-    anchors = [w for w in digit_words if abs(w[0] - qty_x) < 2.0]
+    anchors = [
+        w for w in words
+        if re.fullmatch(r"\d+", w[4] or "") and abs(w[0] - qty_x) < 2.0
+    ]
     anchors.sort(key=lambda w: (w[1], w[0]))
 
     if not anchors:
         return []
 
-    # Центры по Y для расчета границ "строки товара"
-    ys = [(w[1] + w[3]) / 2 for w in anchors]
+    y_centers = [(w[1] + w[3]) / 2 for w in anchors]
+    results: List[Tuple[str, int]] = []
 
-    items: List[Tuple[str, int]] = []
+    for i, anchor in enumerate(anchors):
+        y = y_centers[i]
+        top = (y_centers[i - 1] + y) / 2 if i > 0 else y - 80
+        bottom = (y + y_centers[i + 1]) / 2 if i < len(anchors) - 1 else y + 100
 
-    for i, a in enumerate(anchors):
-        y = ys[i]
-        top = (ys[i - 1] + y) / 2 if i > 0 else y - 80
-        bot = (y + ys[i + 1]) / 2 if i < len(anchors) - 1 else y + 100
-
-        # собираем товар из левой части строки
-        # 0.42 ширины A4 у твоего PDF отлично отделяет колонку "Товар" от "Габариты/Вес/Цена"
         left_limit = page.rect.width * 0.42
-        band = [
-            w for w in words
-            if top <= (w[1] + w[3]) / 2 <= bot and w[0] < left_limit
-        ]
-        band.sort(key=lambda w: (w[1], w[0]))
 
-        text = _normalize_text(" ".join(w[4] for w in band))
-        # убрать возможные остатки заголовка таблицы
-        text = re.sub(r"^(Фото\s+)?Товар\s+", "", text, flags=re.IGNORECASE).strip()
+        name_words = [
+            w for w in words
+            if top <= (w[1] + w[3]) / 2 <= bottom and w[0] < left_limit
+        ]
+        name_words.sort(key=lambda w: (w[1], w[0]))
+
+        name = normalize_text(" ".join(w[4] for w in name_words))
+        name = re.sub(r"^Товар\s*", "", name, flags=re.IGNORECASE)
 
         try:
-            qty = int(a[4])
+            qty = int(anchor[4])
         except ValueError:
             continue
 
-        # фильтр от мусора
-        if not text or text.lower() in {"фото", "товар"}:
-            continue
+        if name:
+            results.append((name, qty))
 
-        items.append((text, qty))
-
-    return items
+    return results
 
 
 def extract_items_from_pdf(pdf_bytes: bytes) -> List[Tuple[str, int]]:
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    all_items: List[Tuple[str, int]] = []
+    aggregated = defaultdict(int)
 
     for page in doc:
-        all_items.extend(_extract_items_from_page(page))
+        for name, qty in extract_from_page(page):
+            aggregated[name] += qty
 
-    # Суммируем одинаковые товары
-    agg = defaultdict(int)
-    for name, qty in all_items:
-        agg[name] += qty
-
-    # стабильная сортировка для одинакового результата
-    result = sorted(agg.items(), key=lambda x: x[0].lower())
-    return result
+    return sorted(aggregated.items(), key=lambda x: x[0].lower())
 
 
-def to_csv_semicolon(rows: List[Tuple[str, int]]) -> bytes:
-    out = io.StringIO()
-    out.write("Товар;Кол-во\n")
+def make_csv(rows: List[Tuple[str, int]]) -> bytes:
+    output = io.StringIO()
+    output.write("Товар;Кол-во\n")
     for name, qty in rows:
-        # Экранируем кавычки + оборачиваем, если вдруг встречаются ; или переносы
         safe = name.replace('"', '""')
         if ";" in safe or "\n" in safe:
             safe = f'"{safe}"'
-        out.write(f"{safe};{qty}\n")
-    return out.getvalue().encode("utf-8-sig")
+        output.write(f"{safe};{qty}\n")
+    return output.getvalue().encode("utf-8-sig")
 
+
+# -------------------------
+# API
+# -------------------------
 
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
 
-@app.post("/extract", summary="Загрузить PDF и получить CSV (товар/кол-во)")
-async def extract(file: UploadFile = File(...)):
-    if not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Загрузите PDF файл.")
-
-    pdf_bytes = await file.read()
-    try:
-        rows = extract_items_from_pdf(pdf_bytes)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Не удалось распарсить PDF: {e}")
-
-    if not rows:
-        raise HTTPException(
-            status_code=422,
-            detail="Не найдено ни одной позиции. Проверьте, что в PDF есть таблица с колонкой 'Кол-во'."
-        )
-
-    csv_bytes = to_csv_semicolon(rows)
-    return Response(
-        content=csv_bytes,
-        media_type="text/csv; charset=utf-8",
-        headers={"Content-Disposition": 'attachment; filename="items.csv"'},
-    )
-@app.get("/")
-def root():
-    return {"status": "ok", "docs": "/docs", "health": "/health", "extract": "/extract"}
-from fastapi.responses import HTMLResponse
-
 @app.get("/info")
 def info():
-    return {"status": "ok", "docs": "/docs", "health": "/health", "extract": "/extract"}
+    return {
+        "status": "ok",
+        "docs": "/docs",
+        "health": "/health",
+        "extract": "/extract"
+    }
+
 
 @app.api_route("/", methods=["GET", "HEAD"], response_class=HTMLResponse)
 def home():
@@ -169,30 +137,51 @@ def home():
 <!doctype html>
 <html lang="ru">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta charset="utf-8">
   <title>PDF → CSV</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <style>
-    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; padding: 24px; line-height: 1.4; }
-    .card { max-width: 720px; margin: 0 auto; padding: 20px; border: 1px solid #ddd; border-radius: 12px; }
-    a { display: inline-block; margin-right: 12px; }
-    code { background:#f6f6f6; padding:2px 6px; border-radius:6px; }
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; padding: 24px; }
+    .box { max-width: 760px; margin: auto; border: 1px solid #ddd; border-radius: 12px; padding: 20px; }
+    a { margin-right: 12px; }
+    code { background: #f5f5f5; padding: 2px 6px; border-radius: 6px; }
   </style>
 </head>
 <body>
-  <div class="card">
-    <h1>PDF → CSV (товар / кол-во)</h1>
-    <p>Сервис работает. Загрузить PDF можно через Swagger:</p>
+  <div class="box">
+    <h1>PDF → CSV</h1>
+    <p>Сервис конвертации PDF в CSV (товар / количество).</p>
     <p>
-      <a href="/docs">/docs</a>
-      <a href="/health">/health</a>
-      <a href="/info">/info</a>
+      <a href="/docs">Swagger</a>
+      <a href="/health">Health</a>
+      <a href="/info">Info (JSON)</a>
     </p>
-    <h3>API</h3>
-    <p><code>POST /extract</code> — загрузка PDF, ответ: CSV с разделителем <code>;</code></p>
+    <p><code>POST /extract</code> — загрузка PDF, результат: CSV с разделителем <b>;</b></p>
   </div>
 </body>
 </html>
 """
 
 
+@app.post("/extract", summary="Загрузить PDF и получить CSV")
+async def extract(file: UploadFile = File(...)):
+    if not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Загрузите PDF файл")
+
+    pdf_bytes = await file.read()
+    rows = extract_items_from_pdf(pdf_bytes)
+
+    if not rows:
+        raise HTTPException(
+            status_code=422,
+            detail="Не удалось найти товары и количество в PDF"
+        )
+
+    csv_bytes = make_csv(rows)
+    return Response(
+        content=csv_bytes,
+        media_type="text/csv; charset=utf-8",
+        headers={
+            "Content-Disposition": 'attachment; filename="items.csv"'
+        },
+    )
