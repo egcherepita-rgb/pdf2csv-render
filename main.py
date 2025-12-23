@@ -157,4 +157,42 @@ async def extract(file: UploadFile = File(...)):
 @app.get("/")
 def root():
     return {"status": "ok", "docs": "/docs", "health": "/health", "extract": "/extract"}
+from fastapi.responses import HTMLResponse
+
+@app.get("/info")
+def info():
+    return {"status": "ok", "docs": "/docs", "health": "/health", "extract": "/extract"}
+
+@app.api_route("/", methods=["GET", "HEAD"], response_class=HTMLResponse)
+def home():
+    return """
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>PDF → CSV</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; padding: 24px; line-height: 1.4; }
+    .card { max-width: 720px; margin: 0 auto; padding: 20px; border: 1px solid #ddd; border-radius: 12px; }
+    a { display: inline-block; margin-right: 12px; }
+    code { background:#f6f6f6; padding:2px 6px; border-radius:6px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>PDF → CSV (товар / кол-во)</h1>
+    <p>Сервис работает. Загрузить PDF можно через Swagger:</p>
+    <p>
+      <a href="/docs">/docs</a>
+      <a href="/health">/health</a>
+      <a href="/info">/info</a>
+    </p>
+    <h3>API</h3>
+    <p><code>POST /extract</code> — загрузка PDF, ответ: CSV с разделителем <code>;</code></p>
+  </div>
+</body>
+</html>
+"""
+
 
