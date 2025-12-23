@@ -8,7 +8,7 @@ from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import Response, HTMLResponse
 
 
-app = FastAPI(title="PDF → CSV (товар / кол-во)", version="1.3.0")
+app = FastAPI(title="PDF → CSV (товар / кол-во)", version="1.3.1")
 
 
 # -------------------------
@@ -32,27 +32,24 @@ def find_word(words: list, target: str) -> Optional[tuple]:
 def layout_from_header(words: list) -> Optional[dict]:
     """
     Ищем шапку таблицы:
-    Фото | Товар | Габариты | Вес | Цена | Кол-во | Сумма
-    Нам нужны: Фото, Товар, Габариты, Кол-во, Сумма
-    Возвращаем X-границы колонок + нижнюю границу шапки.
+    Фото | Товар | Габариты | ... | Кол-во | Сумма
+    Берём "Фото", "Габариты", "Кол-во", "Сумма".
     """
     w_foto = find_word(words, "Фото")
-    w_tovar = find_word(words, "Товар")
     w_gab = find_word(words, "Габариты")
     w_qty = find_word(words, "Кол-во")
     w_sum = find_word(words, "Сумма")
 
-    if not (w_foto and w_tovar and w_gab and w_qty and w_sum):
+    if not (w_foto and w_gab and w_qty and w_sum):
         return None
 
-    header_bottom = max(w_foto[3], w_tovar[3], w_gab[3], w_qty[3], w_sum[3])
+    header_bottom = float(max(w_foto[3], w_gab[3], w_qty[3], w_sum[3]))
 
-    # ВАЖНО: колонка "Товар" реально начинается НЕ с x0("Товар"),
-    # а примерно сразу после колонки "Фото".
-    # Берём левую границу как конец слова "Фото" + небольшой отступ.
+    # Колонка "Товар" начинается после "Фото" и заканчивается перед "Габариты"
     name_left = float(w_foto[2]) + 6.0
     name_right = float(w_gab[0]) - 6.0
 
+    # Колонка "Кол-во" заканчивается перед "Сумма"
     qty_left = float(w_qty[0]) - 3.0
     qty_right = float(w_sum[0]) - 6.0
 
@@ -60,7 +57,7 @@ def layout_from_header(words: list) -> Optional[dict]:
         return None
 
     return {
-        "header_bottom": float(header_bottom),
+        "header_bottom": header_bottom,
         "name_left": name_left,
         "name_right": name_right,
         "qty_left": qty_left,
@@ -69,11 +66,6 @@ def layout_from_header(words: list) -> Optional[dict]:
 
 
 def extract_items_from_page(page: fitz.Page, layout: dict, header_is_present: bool) -> List[Tuple[str, int]]:
-    """
-    Извлекаем товары из страницы по заданной разметке.
-    header_is_present=True -> игнорируем всё выше header_bottom
-    header_is_present=False -> header_bottom считаем 0 (страница-продолжение)
-    """
     words = page.get_text("words")
     if not words:
         return []
@@ -82,24 +74,23 @@ def extract_items_from_page(page: fitz.Page, layout: dict, header_is_present: bo
     name_left, name_right = layout["name_left"], layout["name_right"]
     qty_left, qty_right = layout["qty_left"], layout["qty_right"]
 
-    # 1) числа в колонке Кол-во (строго по X) и ниже шапки (если она есть)
+    # Числа из колонки Кол-во
     qty_cells = []
     for w in words:
         s = w[4] or ""
         if not re.fullmatch(r"\d+", s):
             continue
 
-        x0, y0, x1, y1 = float(w[0]), float(w[1]), float(w[2]), float(w[3])
+        x0, y0, y1 = float(w[0]), float(w[1]), float(w[3])
         if y0 <= header_bottom + 1:
             continue
         if not (qty_left <= x0 <= qty_right):
             continue
 
         q = int(s)
-
-        # Защита от "итого 42869" и прочих больших чисел
+        # защита от "Стоимость проекта 42869"
         if 1 <= q <= 500:
-            qty_cells.append((x0, y0, x1, y1, q))
+            qty_cells.append((float(w[0]), float(w[1]), float(w[2]), float(w[3]), q))
 
     if not qty_cells:
         return []
@@ -111,16 +102,13 @@ def extract_items_from_page(page: fitz.Page, layout: dict, header_is_present: bo
 
     for i, q in enumerate(qty_cells):
         y = y_centers[i]
-
         top = (y_centers[i - 1] + y) / 2 if i > 0 else (header_bottom + 2)
         bottom = (y + y_centers[i + 1]) / 2 if i < len(y_centers) - 1 else (y + 140)
-
         top = max(top, header_bottom + 2)
 
-        # 2) собираем название товара в той же "строке" по Y и в колонке "Товар" по X
         name_words = []
         for w in words:
-            x0, y0, x1, y1 = float(w[0]), float(w[1]), float(w[2]), float(w[3])
+            x0, y0, y1 = float(w[0]), float(w[1]), float(w[3])
             yc = (y0 + y1) / 2
 
             if yc < top or yc > bottom:
@@ -129,23 +117,19 @@ def extract_items_from_page(page: fitz.Page, layout: dict, header_is_present: bo
                 continue
             if not (name_left <= x0 <= name_right):
                 continue
-
             name_words.append(w)
 
         name_words.sort(key=lambda w: (w[1], w[0]))
         name = normalize_text(" ".join(w[4] for w in name_words))
 
-        # Чистка от случайных заголовков, если что-то прилипло
+        # чистка
         name = re.sub(r"^Фото\s*", "", name, flags=re.IGNORECASE).strip()
         name = re.sub(r"^Товар\s*", "", name, flags=re.IGNORECASE).strip()
 
-        # Отсекаем мусорные строки, которые теоретически могут попасть в колонку
         low = name.lower()
         if not name:
             continue
         if "стоимость проекта" in low or "развертка стены" in low:
-            continue
-        if low in {"фото", "товар"}:
             continue
 
         items.append((name, q[4]))
@@ -165,13 +149,10 @@ def extract_items_from_pdf(pdf_bytes: bytes) -> List[Tuple[str, int]]:
             continue
 
         header_layout = layout_from_header(words)
-
         if header_layout is not None:
-            # нашли шапку -> обновляем layout и парсим страницу как страницу с шапкой
             current_layout = header_layout
             page_items = extract_items_from_page(page, current_layout, header_is_present=True)
         else:
-            # шапки нет -> если layout уже был (страница-продолжение), парсим по нему
             if current_layout is None:
                 continue
             page_items = extract_items_from_page(page, current_layout, header_is_present=False)
@@ -183,10 +164,6 @@ def extract_items_from_pdf(pdf_bytes: bytes) -> List[Tuple[str, int]]:
 
 
 def make_csv_cp1251(rows: List[Tuple[str, int]]) -> bytes:
-    """
-    CSV с разделителем ';' и кодировкой cp1251 (Windows-1251),
-    чтобы Excel открывал двойным кликом без кракозябр.
-    """
     output = io.StringIO()
     output.write("Товар;Кол-во\n")
     for name, qty in rows:
@@ -198,23 +175,10 @@ def make_csv_cp1251(rows: List[Tuple[str, int]]) -> bytes:
 
 
 # -------------------------
-# ROUTES
+# HTML (вынесено в константу, чтобы не ломалось)
 # -------------------------
 
-@app.get("/health")
-def health():
-    return {"status": "ok"}
-
-
-@app.get("/info")
-def info():
-    return {"status": "ok", "docs": "/docs", "health": "/health", "extract": "/extract"}
-
-
-@app.api_route("/", methods=["GET", "HEAD"], response_class=HTMLResponse)
-def home():
-    return """
-<!doctype html>
+HOME_HTML = r"""<!doctype html>
 <html lang="ru">
 <head>
   <meta charset="utf-8" />
@@ -255,7 +219,8 @@ def home():
     <div id="status" class="status"></div>
 
     <p class="small">
-      Диагностика: <span class="links">
+      Диагностика:
+      <span class="links">
         <a href="/docs">Swagger</a>
         <a href="/health">Health</a>
         <a href="/info">Info</a>
@@ -299,7 +264,7 @@ def home():
       }
 
       const blob = await resp.blob();
-      const base = (f.name || "items.pdf").replace(/\\.pdf$/i, "");
+      const base = (f.name || "items.pdf").replace(/\.pdf$/i, "");
       const filename = base + ".csv";
 
       const url = URL.createObjectURL(blob);
@@ -307,4 +272,61 @@ def home():
       a.href = url;
       a.download = filename;
       document.body.appendChild(a);
-      a.cli
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+
+      setOk("Готово! CSV скачан: " + filename);
+    } catch (e) {
+      setErr(String(e.message || e));
+    } finally {
+      btn.disabled = !(input.files && input.files[0]);
+    }
+  });
+</script>
+</body>
+</html>
+"""
+
+
+# -------------------------
+# ROUTES
+# -------------------------
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+@app.get("/info")
+def info():
+    return {"status": "ok", "docs": "/docs", "health": "/health", "extract": "/extract"}
+
+
+@app.api_route("/", methods=["GET", "HEAD"], response_class=HTMLResponse)
+def home():
+    return HOME_HTML
+
+
+@app.post("/extract", summary="Загрузить PDF и получить CSV (cp1251, ';')")
+async def extract(file: UploadFile = File(...)):
+    if not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Загрузите PDF файл (.pdf).")
+
+    pdf_bytes = await file.read()
+
+    try:
+        rows = extract_items_from_pdf(pdf_bytes)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Не удалось распарсить PDF: {e}")
+
+    if not rows:
+        raise HTTPException(status_code=422, detail="Не удалось найти таблицу товаров и количества в PDF.")
+
+    csv_bytes = make_csv_cp1251(rows)
+
+    return Response(
+        content=csv_bytes,
+        media_type="text/csv; charset=windows-1251",
+        headers={"Content-Disposition": 'attachment; filename="items.csv"'},
+    )
