@@ -1,6 +1,6 @@
 import io
 import re
-from collections import Counter, defaultdict
+from collections import defaultdict
 from typing import List, Tuple, Optional
 
 import fitz  # PyMuPDF
@@ -8,11 +8,11 @@ from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import Response, HTMLResponse
 
 
-app = FastAPI(title="PDF → CSV (товар / кол-во)", version="1.1.0")
+app = FastAPI(title="PDF → CSV (товар / кол-во)", version="1.2.0")
 
 
 # -------------------------
-# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# УТИЛИТЫ
 # -------------------------
 
 def normalize_text(text: str) -> str:
@@ -21,74 +21,141 @@ def normalize_text(text: str) -> str:
     return text.strip()
 
 
-def detect_qty_column_x(words: list) -> Optional[float]:
+def find_first_word(words: list, target: str) -> Optional[tuple]:
     """
-    Определяем X-координату колонки 'Кол-во' по наиболее частым x0 у чисел.
-    Обычно две самые частые "числовые" колонки — Кол-во и Сумма.
-    Кол-во левее → берём min из топ-2.
+    Ищем слово (токен) в words (page.get_text("words")).
+    Возвращаем первый найденный токен: (x0,y0,x1,y1,word,block,line,word_no)
     """
-    digit_words = [w for w in words if re.fullmatch(r"\d+", w[4] or "")]
-    if not digit_words:
+    t = target.lower()
+    for w in words:
+        if (w[4] or "").lower() == t:
+            return w
+    return None
+
+
+def table_layout_from_header(words: list) -> Optional[dict]:
+    """
+    На странице ищем шапку таблицы:
+    "Товар", "Габариты", "Кол-во", "Сумма"
+    Если нашлась — возвращаем координаты колонок и нижнюю границу шапки.
+    """
+    w_tovar = find_first_word(words, "Товар")
+    w_gab = find_first_word(words, "Габариты")
+    w_qty = find_first_word(words, "Кол-во")
+    w_sum = find_first_word(words, "Сумма")
+
+    if not (w_tovar and w_gab and w_qty and w_sum):
         return None
 
-    xs = [round(w[0], 1) for w in digit_words]
-    top = Counter(xs).most_common(2)
-    if not top:
+    header_bottom = max(w_tovar[3], w_gab[3], w_qty[3], w_sum[3])
+
+    # Границы колонок по X:
+    # Название товара: между "Товар" и "Габариты"
+    name_left = w_tovar[0] - 2
+    name_right = w_gab[0] - 2
+
+    # Кол-во: между "Кол-во" и "Сумма"
+    qty_left = w_qty[0] - 2
+    qty_right = w_sum[0] - 2
+
+    # На всякий случай, если PDF чуть “плывёт”
+    if name_right <= name_left or qty_right <= qty_left:
         return None
 
-    return min(x for x, _ in top)
+    return {
+        "header_bottom": header_bottom,
+        "name_left": name_left,
+        "name_right": name_right,
+        "qty_left": qty_left,
+        "qty_right": qty_right,
+    }
 
 
-def extract_from_page(page: fitz.Page) -> List[Tuple[str, int]]:
-    words = page.get_text("words")  # (x0,y0,x1,y1,word,block,line,word_no)
+def extract_items_from_page(page: fitz.Page) -> List[Tuple[str, int]]:
+    """
+    Извлекаем товары только из таблицы (если есть шапка).
+    """
+    words = page.get_text("words")
     if not words:
         return []
 
-    qty_x = detect_qty_column_x(words)
-    if qty_x is None:
+    layout = table_layout_from_header(words)
+    if layout is None:
+        # Нет шапки таблицы -> это не страница со списком товаров
         return []
 
-    # "якоря" — числа в колонке количества
-    anchors = [
-        w for w in words
-        if re.fullmatch(r"\d+", w[4] or "") and abs(w[0] - qty_x) < 2.0
-    ]
-    anchors.sort(key=lambda w: (w[1], w[0]))
+    header_bottom = layout["header_bottom"]
+    name_left, name_right = layout["name_left"], layout["name_right"]
+    qty_left, qty_right = layout["qty_left"], layout["qty_right"]
 
-    if not anchors:
+    # 1) Находим числа в колонке "Кол-во" НИЖЕ шапки
+    qty_words = []
+    for w in words:
+        txt = w[4] or ""
+        if not re.fullmatch(r"\d+", txt):
+            continue
+
+        x0, y0, x1, y1 = w[0], w[1], w[2], w[3]
+        if y0 <= header_bottom + 1:
+            continue
+        if not (qty_left <= x0 <= qty_right):
+            continue
+
+        qty = int(txt)
+        # фильтр от мусора: в проектах кол-во обычно не тысячи
+        if 1 <= qty <= 500:
+            qty_words.append((x0, y0, x1, y1, qty))
+
+    if not qty_words:
         return []
 
-    y_centers = [(w[1] + w[3]) / 2 for w in anchors]
-    results: List[Tuple[str, int]] = []
+    # Сортировка сверху вниз
+    qty_words.sort(key=lambda t: (t[1], t[0]))
 
-    for i, anchor in enumerate(anchors):
+    # 2) Строим "строки" по Y вокруг каждого qty
+    y_centers = [(q[1] + q[3]) / 2 for q in qty_words]
+
+    items: List[Tuple[str, int]] = []
+
+    for i, q in enumerate(qty_words):
         y = y_centers[i]
-        top = (y_centers[i - 1] + y) / 2 if i > 0 else y - 80
-        bottom = (y + y_centers[i + 1]) / 2 if i < len(anchors) - 1 else y + 100
 
-        # Левая часть строки — колонка "Товар"
-        left_limit = page.rect.width * 0.42
+        # границы строки — середина между соседними количествами
+        top = (y_centers[i - 1] + y) / 2 if i > 0 else (header_bottom + 2)
+        bottom = (y + y_centers[i + 1]) / 2 if i < len(y_centers) - 1 else (y + 120)
 
-        name_words = [
-            w for w in words
-            if top <= (w[1] + w[3]) / 2 <= bottom and w[0] < left_limit
-        ]
+        # top не должен заходить на шапку
+        top = max(top, header_bottom + 2)
+
+        # 3) Собираем название товара строго из колонки "Товар"
+        name_words = []
+        for w in words:
+            txt = w[4] or ""
+            x0, y0, x1, y1 = w[0], w[1], w[2], w[3]
+            yc = (y0 + y1) / 2
+
+            if yc < top or yc > bottom:
+                continue
+            if y0 <= header_bottom + 1:
+                continue
+            if not (name_left <= x0 <= name_right):
+                continue
+
+            name_words.append(w)
+
         name_words.sort(key=lambda w: (w[1], w[0]))
-
         name = normalize_text(" ".join(w[4] for w in name_words))
+
+        # доп. чистка от случайных прилипаний
+        name = re.sub(r"^Фото\s*", "", name, flags=re.IGNORECASE).strip()
         name = re.sub(r"^Товар\s*", "", name, flags=re.IGNORECASE).strip()
 
-        try:
-            qty = int(anchor[4])
-        except ValueError:
+        if not name:
             continue
 
-        if not name or name.lower() in {"товар", "фото"}:
-            continue
+        items.append((name, q[4]))
 
-        results.append((name, qty))
-
-    return results
+    return items
 
 
 def extract_items_from_pdf(pdf_bytes: bytes) -> List[Tuple[str, int]]:
@@ -96,7 +163,7 @@ def extract_items_from_pdf(pdf_bytes: bytes) -> List[Tuple[str, int]]:
     aggregated = defaultdict(int)
 
     for page in doc:
-        for name, qty in extract_from_page(page):
+        for name, qty in extract_items_from_page(page):
             aggregated[name] += qty
 
     return sorted(aggregated.items(), key=lambda x: x[0].lower())
@@ -105,17 +172,15 @@ def extract_items_from_pdf(pdf_bytes: bytes) -> List[Tuple[str, int]]:
 def make_csv_cp1251(rows: List[Tuple[str, int]]) -> bytes:
     """
     CSV с разделителем ';' и кодировкой cp1251 (Windows-1251),
-    чтобы Excel открывал двойным кликом без "кракозябр".
+    чтобы Excel открывал двойным кликом без кракозябр.
     """
     output = io.StringIO()
     output.write("Товар;Кол-во\n")
-
     for name, qty in rows:
         safe = name.replace('"', '""')
         if ";" in safe or "\n" in safe:
             safe = f'"{safe}"'
         output.write(f"{safe};{qty}\n")
-
     return output.getvalue().encode("cp1251", errors="replace")
 
 
@@ -135,7 +200,6 @@ def info():
 
 @app.api_route("/", methods=["GET", "HEAD"], response_class=HTMLResponse)
 def home():
-    # Простая страница: выбор PDF → отправка → скачивание CSV
     return """
 <!doctype html>
 <html lang="ru">
@@ -168,7 +232,7 @@ def home():
   <div class="card">
     <h1>PDF → CSV</h1>
     <p>Загрузите PDF и получите CSV с двумя колонками: <b>Товар</b> и <b>Кол-во</b>.</p>
-    <p class="hint">CSV отдаётся в кодировке <b>Windows-1251</b> и с разделителем <b>;</b> — Excel открывает без “кракозябр”.</p>
+    <p class="hint">CSV: кодировка <b>Windows-1251</b>, разделитель <b>;</b> (Excel открывает без кракозябр).</p>
 
     <div class="row">
       <input id="pdf" type="file" accept="application/pdf,.pdf" />
@@ -192,23 +256,14 @@ def home():
   const btn = document.getElementById('btn');
   const statusEl = document.getElementById('status');
 
-  function setStatusOk(msg) {
-    statusEl.className = "status ok";
-    statusEl.textContent = msg;
-  }
-  function setStatusErr(msg) {
-    statusEl.className = "status err";
-    statusEl.textContent = msg;
-  }
-  function setStatusNeutral(msg) {
-    statusEl.className = "status";
-    statusEl.textContent = msg || "";
-  }
+  function setOk(msg){ statusEl.className="status ok"; statusEl.textContent=msg; }
+  function setErr(msg){ statusEl.className="status err"; statusEl.textContent=msg; }
+  function setNeutral(msg){ statusEl.className="status"; statusEl.textContent=msg||""; }
 
   input.addEventListener('change', () => {
     const f = input.files && input.files[0];
     btn.disabled = !f;
-    setStatusNeutral(f ? ("Выбран файл: " + f.name) : "");
+    setNeutral(f ? ("Выбран файл: " + f.name) : "");
   });
 
   btn.addEventListener('click', async () => {
@@ -216,7 +271,7 @@ def home():
     if (!f) return;
 
     btn.disabled = true;
-    setStatusNeutral("Обработка PDF…");
+    setNeutral("Обработка PDF…");
 
     try {
       const fd = new FormData();
@@ -225,18 +280,12 @@ def home():
       const resp = await fetch("/extract", { method: "POST", body: fd });
 
       if (!resp.ok) {
-        // FastAPI обычно отдаёт JSON с detail
         let text = await resp.text();
-        try {
-          const j = JSON.parse(text);
-          text = j.detail ? String(j.detail) : text;
-        } catch {}
+        try { const j = JSON.parse(text); if (j.detail) text = String(j.detail); } catch {}
         throw new Error("Ошибка " + resp.status + ": " + text);
       }
 
       const blob = await resp.blob();
-
-      // Имя файла: items.csv или производное от PDF
       const base = (f.name || "items.pdf").replace(/\\.pdf$/i, "");
       const filename = base + ".csv";
 
@@ -249,9 +298,9 @@ def home():
       a.remove();
       URL.revokeObjectURL(url);
 
-      setStatusOk("Готово! CSV скачан: " + filename);
+      setOk("Готово! CSV скачан: " + filename);
     } catch (e) {
-      setStatusErr(String(e.message || e));
+      setErr(String(e.message || e));
     } finally {
       btn.disabled = !(input.files && input.files[0]);
     }
@@ -275,7 +324,7 @@ async def extract(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=f"Не удалось распарсить PDF: {e}")
 
     if not rows:
-        raise HTTPException(status_code=422, detail="Не удалось найти товары и количество в PDF.")
+        raise HTTPException(status_code=422, detail="Не удалось найти таблицу товаров (шапку 'Товар/Габариты/Кол-во/Сумма').")
 
     csv_bytes = make_csv_cp1251(rows)
 
