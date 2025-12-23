@@ -154,3 +154,7 @@ async def extract(file: UploadFile = File(...)):
         media_type="text/csv; charset=utf-8",
         headers={"Content-Disposition": 'attachment; filename="items.csv"'},
     )
+@app.get("/")
+def root():
+    return {"status": "ok", "docs": "/docs", "health": "/health", "extract": "/extract"}
+
