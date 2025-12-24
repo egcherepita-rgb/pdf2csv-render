@@ -8,16 +8,20 @@ from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import Response, HTMLResponse
 
 
-app = FastAPI(title="PDF → CSV (товар / кол-во)", version="2.1.0")
+app = FastAPI(title="PDF → CSV (товар / кол-во)", version="2.2.0")
 
-# --- regex / helpers ---
+# -------------------------
+# Regex
+# -------------------------
 RX_DIM_LINE = re.compile(r"\b\d{2,}[xх]\d{2,}(?:[xх]\d{1,})?\b.*\bмм\b", re.IGNORECASE)
-RX_WEIGHT = re.compile(r"\b\d+(?:[.,]\d+)?\s*кг\.?\b", re.IGNORECASE)
-RX_PRICE = re.compile(r"\b\d+(?:[.,]\d+)\s*₽\b")  # 290.00 ₽
+RX_WEIGHT_LINE = re.compile(r"\b\d+(?:[.,]\d+)?\s*кг\.?\b", re.IGNORECASE)
+RX_PRICE_LINE = re.compile(r"\b\d+(?:[.,]\d+)\s*₽\b")  # 290.00 ₽ / 290,00 ₽
 RX_INT = re.compile(r"^\d+$")
-RX_SUM = re.compile(r"^\d+(?:[ \u00a0]\d{3})*\s*₽$")  # 8 580 ₽ или 8580 ₽
+RX_SUM_LINE = re.compile(r"^\d+(?:[ \u00a0]\d{3})*\s*₽$")  # 8580 ₽ / 8 580 ₽
 
-
+# -------------------------
+# Utils
+# -------------------------
 def normalize_space(s: str) -> str:
     s = (s or "").replace("\u00a0", " ")
     s = re.sub(r"\s+", " ", s)
@@ -30,15 +34,22 @@ def split_lines(page: fitz.Page) -> List[str]:
     return [x for x in lines if x]
 
 
-def detect_table_start(lines: List[str]) -> bool:
-    # В твоих PDF шапка идёт отдельными строками: Фото / Товар / ...
-    head = " ".join(lines[:30]).lower().replace("–", "-").replace("—", "-")
-    return ("фото" in head) and ("товар" in head) and ("габариты" in head) and (
-        ("кол-во" in head) or ("кол-ва" in head) or ("колво" in head) or ("кол во" in head)
-    )
+def is_footer_or_noise(line: str) -> bool:
+    low = line.lower()
+    if low.startswith("страница:"):
+        return True
+    if low.startswith("ваш проект"):
+        return True
+    if "проект создан" in low:
+        return True
+    if "развертка стены" in low:
+        return True
+    if "стоимость проекта" in low:
+        return True
+    return False
 
 
-def is_end_of_table(line: str) -> bool:
+def is_totals_block(line: str) -> bool:
     low = line.lower()
     return (
         low.startswith("общий вес")
@@ -49,98 +60,74 @@ def is_end_of_table(line: str) -> bool:
     )
 
 
-def is_footer(line: str) -> bool:
-    return line.lower().startswith("страница:")
+def is_project_total_only(line: str) -> bool:
+    # строка вида "63376 ₽"
+    return bool(re.fullmatch(r"\d+\s*₽", normalize_space(line)))
 
 
-def is_header_token(line: str) -> bool:
-    # строки шапки таблицы, которые не являются товарами
-    low = line.lower().replace("–", "-").replace("—", "-")
-    return low in {
-        "фото",
-        "товар",
-        "габариты",
-        "вес",
-        "цена за шт",
-        "кол-во",
-        "сумма",
-    }
-
-
-def clean_name(name_lines: List[str]) -> str:
-    # склеиваем, убираем мусор
-    name = normalize_space(" ".join(name_lines))
+def clean_name(lines: List[str]) -> str:
+    name = normalize_space(" ".join(lines))
     name = re.sub(r"^Фото\s*", "", name, flags=re.IGNORECASE).strip()
     name = re.sub(r"^Товар\s*", "", name, flags=re.IGNORECASE).strip()
     name = re.sub(r"Страница:.*$", "", name, flags=re.IGNORECASE).strip()
     return name
 
 
-def extract_item_from_lines(lines: List[str], start_idx: int, name_buf: List[str]) -> Tuple[Optional[Tuple[str, int]], int]:
+def extract_item_after_dim(lines: List[str], dim_idx: int, name_buf: List[str]) -> Tuple[Optional[Tuple[str, int]], int]:
     """
-    start_idx указывает на строку с габаритами (в ней есть 'мм' и размер).
-    Возвращает (item, next_idx). item = (name, qty) или None если не получилось.
+    dim_idx — индекс строки с габаритами (есть мм и размер).
+    В окне следующих строк ищем:
+      цена -> qty -> сумма.
+    Возвращаем (item, next_idx).
     """
-    # имя товара — всё, что накопили ДО строки с габаритами
     name = clean_name(name_buf)
     name_buf.clear()
 
-    # если имя пустое — пытаемся собрать имя из строк сразу перед габаритами (иногда буфер мог быть пуст)
-    if not name:
-        # максимум 3 строки выше (но это редкость)
-        pass
+    # окно поиска (в твоих PDF хватает 8, но берём 12 с запасом)
+    end = min(len(lines), dim_idx + 12)
+    i = dim_idx + 1
 
-    # После строки с габаритами могут быть:
-    # - вес отдельной строкой (0.4 кг.)
-    # - цена (290.00 ₽)
-    # - кол-во (1)
-    # - сумма (290 ₽)
-    i = start_idx + 1
-    max_i = min(len(lines), start_idx + 8)
-
-    # пропускаем вес (может быть сразу в строке габаритов или отдельной строкой)
-    if i < len(lines) and RX_WEIGHT.search(lines[i]):
+    # пропускаем возможный вес
+    if i < end and RX_WEIGHT_LINE.search(lines[i]):
         i += 1
 
-    # ищем цену в окне
+    # ищем цену
     price_idx = None
-    for j in range(i, max_i):
-        if RX_PRICE.search(lines[j]):
+    for j in range(i, end):
+        if RX_PRICE_LINE.search(lines[j]):
             price_idx = j
             break
     if price_idx is None:
-        return None, start_idx + 1
+        return None, dim_idx + 1
 
-    # ищем количество: первое целое число после цены
+    # ищем количество (отдельная строка с целым числом)
     qty_idx = None
-    for j in range(price_idx + 1, max_i):
+    for j in range(price_idx + 1, end):
         if RX_INT.fullmatch(lines[j]):
             qty_idx = j
             break
     if qty_idx is None:
-        return None, start_idx + 1
+        return None, dim_idx + 1
 
     qty = int(lines[qty_idx])
     if not (1 <= qty <= 500):
-        return None, start_idx + 1
+        return None, dim_idx + 1
 
-    # ищем сумму после qty (не обязательно, но как контроль)
+    # ищем сумму после qty (строка с ₽)
     sum_idx = None
-    for j in range(qty_idx + 1, max_i):
+    for j in range(qty_idx + 1, end):
         if "₽" in lines[j]:
             sum_idx = j
             break
 
-    # Если имя всё ещё пустое — значит буфер не собрался: пробуем взять 1–4 строки перед габаритами
+    # Если имя пустое — пробуем взять строки прямо перед dim_idx (иногда буфер мог быть сброшен шумом)
     if not name:
-        # берём строки назад до предыдущего “блока”
         back = []
-        k = start_idx - 1
-        while k >= 0 and len(back) < 5:
-            if is_header_token(lines[k]) or is_footer(lines[k]) or is_end_of_table(lines[k]):
+        k = dim_idx - 1
+        while k >= 0 and len(back) < 6:
+            if is_footer_or_noise(lines[k]) or is_totals_block(lines[k]) or is_project_total_only(lines[k]):
                 break
-            # останавливаемся если встречаем строку, похожую на цену/сумму/кол-во/вес/габариты
-            if RX_DIM_LINE.search(lines[k]) or RX_WEIGHT.search(lines[k]) or RX_PRICE.search(lines[k]) or RX_INT.fullmatch(lines[k]) or RX_SUM.fullmatch(lines[k]):
+            if RX_DIM_LINE.search(lines[k]) or RX_WEIGHT_LINE.search(lines[k]) or RX_PRICE_LINE.search(lines[k]) or RX_INT.fullmatch(lines[k]) or RX_SUM_LINE.fullmatch(lines[k]):
                 break
             back.append(lines[k])
             k -= 1
@@ -148,18 +135,21 @@ def extract_item_from_lines(lines: List[str], start_idx: int, name_buf: List[str
         name = clean_name(back)
 
     if not name:
-        return None, start_idx + 1
+        return None, dim_idx + 1
 
-    # next idx — после суммы (если нашли), иначе после qty
     next_idx = (sum_idx + 1) if sum_idx is not None else (qty_idx + 1)
-    return (name, qty), next_idx
+    return (name, qty), max(next_idx, dim_idx + 1)
 
 
 def extract_items_from_pdf(pdf_bytes: bytes) -> List[Tuple[str, int]]:
+    """
+    Парсим весь документ без поиска шапки.
+    Правило: товар = название (несколько строк) + строка с габаритами (мм) + цена + qty + сумма.
+    Порядок сохраняем как в PDF. Повторы суммируем по первому появлению.
+    """
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
 
     ordered = OrderedDict()  # name -> qty
-    in_table = False
     name_buf: List[str] = []
 
     for page in doc:
@@ -167,58 +157,49 @@ def extract_items_from_pdf(pdf_bytes: bytes) -> List[Tuple[str, int]]:
         if not lines:
             continue
 
-        if detect_table_start(lines):
-            in_table = True
-            name_buf.clear()
-
-        if not in_table:
-            continue
-
         i = 0
         while i < len(lines):
             line = lines[i]
 
-            if is_footer(line):
+            if is_footer_or_noise(line):
                 i += 1
                 continue
 
-            if is_end_of_table(line):
-                in_table = False
+            # если пошли итоги — сбрасываем буфер, но продолжаем скан (вдруг дальше ещё страницы с таблицей)
+            if is_totals_block(line) or is_project_total_only(line):
                 name_buf.clear()
-                break
-
-            # пропускаем шапку таблицы
-            if is_header_token(line):
                 i += 1
                 continue
 
-            # строки "Ваш проект / Стоимость проекта" (они бывают на первых страницах)
-            low = line.lower()
-            if low.startswith("ваш проект") or "стоимость проекта" in low or "проект создан" in low or "развертка стены" in low:
-                i += 1
-                continue
-
-            # если встретили строку габаритов — фиксируем товар
             if RX_DIM_LINE.search(line):
-                item, next_i = extract_item_from_lines(lines, i, name_buf)
+                item, next_i = extract_item_after_dim(lines, i, name_buf)
                 if item is not None:
                     name, qty = item
-                    if name in ordered:
-                        ordered[name] += qty
-                    else:
-                        ordered[name] = qty
-                    i = max(next_i, i + 1)
+                    low = name.lower()
+                    # страховка от мусора
+                    if "стоимость проекта" not in low and "развертка стены" not in low and len(name) >= 3:
+                        if name in ordered:
+                            ordered[name] += qty
+                        else:
+                            ordered[name] = qty
+                    i = next_i
                     continue
-                # если не смогли распарсить — просто идём дальше, но буфер очищен в extract_item
+
+                # не получилось распарсить — просто идём дальше
                 i += 1
                 continue
 
-            # иначе это часть названия (в т.ч. переносы: "Обувница выдвижная" / "ПРАКТИК Home GOV-60" / "белая")
+            # обычная строка — часть названия (копим, включая переносы на следующую страницу)
+            # но не копим очевидные заголовочные слова
+            low = line.lower().replace("–", "-").replace("—", "-")
+            if low in {"фото", "товар", "габариты", "вес", "цена за шт", "кол-во", "сумма"}:
+                i += 1
+                continue
+
             name_buf.append(line)
             i += 1
 
-        # если страница закончилась, а имя копится — оставляем буфер, чтобы склеить с продолжением на след. странице
-        # (это как раз лечит переносы типа "Обувница..." на разрыве)
+        # не очищаем name_buf на границе страниц — это как раз помогает "Обувнице" на разрыве
 
     return list(ordered.items())
 
