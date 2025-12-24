@@ -8,7 +8,7 @@ from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import Response, HTMLResponse
 
 
-app = FastAPI(title="PDF → CSV (товар / кол-во)", version="1.5.1")
+app = FastAPI(title="PDF → CSV (товар / кол-во)", version="1.5.2")
 
 RX_INT = re.compile(r"^\d+$")
 RX_DIM = re.compile(r"^\d{2,}[xх]\d{2,}([xх]\d{1,})?$", re.IGNORECASE)  # 950x48x9 / 1250x25x25
@@ -34,33 +34,30 @@ def find_word(words: list, target: str) -> Optional[tuple]:
 
 def find_footer_cutoff_y(words: list, page_height: float) -> float:
     """
-    Возвращает Y-координату, выше которой контент, а ниже — футер.
-    Если на странице есть "Страница:", берём её y0 - небольшой отступ.
-    Иначе fallback: page_height - 55.
+    Динамически отрезаем футер, чтобы "Страница: X из Y" не прилипал к последней строке.
     """
-    footer = None
     for w in words:
-        if (w[4] or "").lower().startswith("страница"):
-            footer = w
-            break
-    if footer is None:
-        return page_height - 55.0
-    return float(footer[1]) - 4.0
+        txt = (w[4] or "").lower()
+        if txt.startswith("страница"):
+            return float(w[1]) - 4.0
+    return page_height - 55.0
 
 
 def compute_layout_from_header(words: list) -> Optional[dict]:
     """
-    Ищем шапку таблицы: Фото | ... | Габариты | ... | Кол-во | Сумма
-    Границы:
-      - name_left: после "Фото"
-      - qty_left/qty_right: по "Кол-во" и "Сумма"
-    ВАЖНО: правую границу "Товара" в строках считаем динамически (по габаритам внутри строки),
-    поэтому здесь фиксируем только name_left и qty.
+    Определяем разметку таблицы по шапке:
+    Фото | ... | Габариты | ... | Кол-во | Сумма
+
+    Мы фиксируем:
+    - header_bottom
+    - name_left (после "Фото")
+    - qty_left/qty_right (между "Кол-во" и "Сумма")
+    Правую границу названия делаем динамической на уровне строки (по габаритам/кол-ву).
     """
     w_foto = find_word(words, "Фото")
+    w_gab = find_word(words, "Габариты")
     w_qty = find_word(words, "Кол-во")
     w_sum = find_word(words, "Сумма")
-    w_gab = find_word(words, "Габариты")  # только для проверки, что это таблица
 
     if not (w_foto and w_gab and w_qty and w_sum):
         return None
@@ -83,6 +80,9 @@ def compute_layout_from_header(words: list) -> Optional[dict]:
 
 
 def make_csv_cp1251(rows: List[Tuple[str, int]]) -> bytes:
+    """
+    CSV ';' + cp1251, чтобы Excel открывал двойным кликом.
+    """
     out = io.StringIO()
     out.write("Товар;Кол-во\n")
     for name, qty in rows:
@@ -94,7 +94,7 @@ def make_csv_cp1251(rows: List[Tuple[str, int]]) -> bytes:
 
 
 # -------------------------
-# ПАРСИНГ ТАБЛИЦЫ
+# ПАРСИНГ
 # -------------------------
 
 def extract_rows_on_page(page: fitz.Page, layout: dict, header_present: bool) -> List[Tuple[str, int]]:
@@ -106,15 +106,15 @@ def extract_rows_on_page(page: fitz.Page, layout: dict, header_present: bool) ->
     name_left = layout["name_left"]
     qty_left, qty_right = layout["qty_left"], layout["qty_right"]
 
-    # динамический низ контента (чтобы футер не прилипал и не резал последнюю позицию)
     max_content_y = find_footer_cutoff_y(words, float(page.rect.height))
 
-    # 1) Ищем количества в колонке "Кол-во"
+    # 1) Кол-во (строго из колонки Кол-во)
     qty_cells = []
     for w in words:
         s = w[4] or ""
         if not RX_INT.fullmatch(s):
             continue
+
         x0, y0 = float(w[0]), float(w[1])
         if y0 <= hb + 1:
             continue
@@ -142,7 +142,7 @@ def extract_rows_on_page(page: fitz.Page, layout: dict, header_present: bool) ->
         bottom = (y + y_centers[i + 1]) / 2.0 if i < len(y_centers) - 1 else min(y + 220.0, max_content_y)
         top = max(top, hb + 2.0)
 
-        # Слова в полосе строки
+        # Все слова в полосе строки
         band = []
         for w in words:
             x0, y0, y1 = float(w[0]), float(w[1]), float(w[3])
@@ -153,8 +153,9 @@ def extract_rows_on_page(page: fitz.Page, layout: dict, header_present: bool) ->
                 continue
             band.append(w)
 
-        # 2) Находим начало габаритов В ЭТОЙ ЖЕ строке:
-        # если есть "мм", то ищем самое левое DIM-слово (950x48x9) — это и есть старт габаритов
+        # 2) Динамическая правая граница названия:
+        # если в строке есть "мм" -> режем до начала габаритов (DIM-слово),
+        # иначе режем до колонки Кол-во (это помогает на переносах между страницами).
         has_mm = any((w[4] or "").lower() == "мм" for w in band)
         gab_x_min = None
         if has_mm:
@@ -162,13 +163,9 @@ def extract_rows_on_page(page: fitz.Page, layout: dict, header_present: bool) ->
             if dim_xs:
                 gab_x_min = min(dim_xs)
 
-        # Правая граница названия:
-        # - если нашли габариты -> режем до них
-        # - иначе режем до колонки количества (это безопасно)
         right_limit = (gab_x_min - 3.0) if gab_x_min is not None else (qty_left - 8.0)
 
-        # 3) Собираем название товара: ВСЁ слева от right_limit (без фикса на "колонку габаритов"),
-        # чтобы не потерять сдвинутые строки типа "ПРАКТИК Home GOV-60"
+        # 3) Название: всё слева от right_limit, начиная от name_left
         name_words = []
         for w in band:
             x0 = float(w[0])
@@ -176,15 +173,14 @@ def extract_rows_on_page(page: fitz.Page, layout: dict, header_present: bool) ->
                 continue
             if x0 >= right_limit:
                 continue
-            # не берём явные единицы измерения, чтобы не прилипло
-            if (w[4] or "").lower() in {"мм", "кг.", "кг"}:
+            if (w[4] or "").lower() in {"мм", "кг", "кг."}:
                 continue
             name_words.append(w)
 
         name_words.sort(key=lambda w: (w[1], w[0]))
         name = normalize_text(" ".join(w[4] for w in name_words))
 
-        # Чистка мусора
+        # Чистка
         name = re.sub(r"^Фото\s*", "", name, flags=re.IGNORECASE).strip()
         name = re.sub(r"^Товар\s*", "", name, flags=re.IGNORECASE).strip()
         name = re.sub(r"Страница:.*$", "", name, flags=re.IGNORECASE).strip()
@@ -199,11 +195,10 @@ def extract_rows_on_page(page: fitz.Page, layout: dict, header_present: bool) ->
 
 def extract_items_from_pdf(pdf_bytes: bytes) -> List[Tuple[str, int]]:
     """
-    Порядок сохраняется как в PDF.
-    Если товар повторится — суммируем, но позиция остаётся по первому появлению.
+    Порядок — как в PDF.
+    Повторы суммируем, но место в списке сохраняется по первому появлению.
     """
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-
     layout = None
     ordered = OrderedDict()  # name -> qty
 
@@ -228,45 +223,129 @@ def extract_items_from_pdf(pdf_bytes: bytes) -> List[Tuple[str, int]]:
             else:
                 ordered[name] = qty
 
-    return [(k, v) for k, v in ordered.items()]
+    return list(ordered.items())
 
 
 # -------------------------
-# HTML
+# HTML (БЕЗ triple quotes)
 # -------------------------
 
-HOME_HTML = r"""<!doctype html>
-<html lang="ru">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>PDF → CSV</title>
-  <style>
-    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; padding: 24px; background:#fafafa; }
-    .card { max-width: 860px; margin: 0 auto; background:#fff; border: 1px solid #e5e5e5; border-radius: 14px; padding: 22px; }
-    h1 { margin: 0 0 10px; font-size: 28px; }
-    p { margin: 8px 0; color:#333; }
-    .row { display:flex; gap: 12px; flex-wrap: wrap; align-items: center; margin-top: 14px; }
-    input[type="file"] { padding: 10px; border: 1px solid #ddd; border-radius: 10px; background:#fff; }
-    button { padding: 10px 14px; border: 0; border-radius: 10px; cursor: pointer; font-weight: 600; }
-    button.primary { background: #111; color: #fff; }
-    button.primary:disabled { opacity: .55; cursor:not-allowed; }
-    .status { margin-top: 12px; font-size: 14px; white-space: pre-wrap; }
-    .ok { color: #0a7a2f; }
-    .err { color: #b00020; }
-    .hint { color:#666; font-size: 14px; }
-  </style>
-</head>
-<body>
-  <div class="card">
-    <h1>PDF → CSV</h1>
-    <p>Загрузите PDF и получите CSV (2 колонки: <b>Товар</b> и <b>Кол-во</b>) в порядке как в PDF.</p>
-    <p class="hint">CSV: кодировка <b>Windows-1251</b>, разделитель <b>;</b>.</p>
+HOME_HTML = "\n".join([
+    "<!doctype html>",
+    "<html lang='ru'>",
+    "<head>",
+    "  <meta charset='utf-8' />",
+    "  <meta name='viewport' content='width=device-width, initial-scale=1' />",
+    "  <title>PDF → CSV</title>",
+    "  <style>",
+    "    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; padding: 24px; background:#fafafa; }",
+    "    .card { max-width: 860px; margin: 0 auto; background:#fff; border: 1px solid #e5e5e5; border-radius: 14px; padding: 22px; }",
+    "    h1 { margin: 0 0 10px; font-size: 28px; }",
+    "    p { margin: 8px 0; color:#333; }",
+    "    .row { display:flex; gap: 12px; flex-wrap: wrap; align-items: center; margin-top: 14px; }",
+    "    input[type=file] { padding: 10px; border: 1px solid #ddd; border-radius: 10px; background:#fff; }",
+    "    button { padding: 10px 14px; border: 0; border-radius: 10px; cursor: pointer; font-weight: 600; }",
+    "    button.primary { background: #111; color: #fff; }",
+    "    button.primary:disabled { opacity: .55; cursor:not-allowed; }",
+    "    .status { margin-top: 12px; font-size: 14px; white-space: pre-wrap; }",
+    "    .ok { color: #0a7a2f; }",
+    "    .err { color: #b00020; }",
+    "    .hint { color:#666; font-size: 14px; }",
+    "  </style>",
+    "</head>",
+    "<body>",
+    "  <div class='card'>",
+    "    <h1>PDF → CSV</h1>",
+    "    <p>Загрузите PDF и получите CSV (2 колонки: <b>Товар</b> и <b>Кол-во</b>) в порядке как в PDF.</p>",
+    "    <p class='hint'>CSV: кодировка <b>Windows-1251</b>, разделитель <b>;</b>.</p>",
+    "    <div class='row'>",
+    "      <input id='pdf' type='file' accept='application/pdf,.pdf' />",
+    "      <button id='btn' class='primary' disabled>Получить CSV</button>",
+    "    </div>",
+    "    <div id='status' class='status'></div>",
+    "  </div>",
+    "  <script>",
+    "    const input = document.getElementById('pdf');",
+    "    const btn = document.getElementById('btn');",
+    "    const statusEl = document.getElementById('status');",
+    "    function ok(msg){ statusEl.className='status ok'; statusEl.textContent=msg; }",
+    "    function err(msg){ statusEl.className='status err'; statusEl.textContent=msg; }",
+    "    function neutral(msg){ statusEl.className='status'; statusEl.textContent=msg||''; }",
+    "    input.addEventListener('change', () => {",
+    "      const f = input.files && input.files[0];",
+    "      btn.disabled = !f;",
+    "      neutral(f ? ('Выбран файл: ' + f.name) : '');",
+    "    });",
+    "    btn.addEventListener('click', async () => {",
+    "      const f = input.files && input.files[0];",
+    "      if (!f) return;",
+    "      btn.disabled = true;",
+    "      neutral('Обработка PDF…');",
+    "      try {",
+    "        const fd = new FormData();",
+    "        fd.append('file', f);",
+    "        const resp = await fetch('/extract', { method: 'POST', body: fd });",
+    "        if (!resp.ok) {",
+    "          let text = await resp.text();",
+    "          try { const j = JSON.parse(text); if (j.detail) text = String(j.detail); } catch(e) {}",
+    "          throw new Error('Ошибка ' + resp.status + ': ' + text);",
+    "        }",
+    "        const blob = await resp.blob();",
+    "        const base = (f.name || 'items.pdf').replace(/\\.pdf$/i, '');",
+    "        const filename = base + '.csv';",
+    "        const url = URL.createObjectURL(blob);",
+    "        const a = document.createElement('a');",
+    "        a.href = url;",
+    "        a.download = filename;",
+    "        document.body.appendChild(a);",
+    "        a.click();",
+    "        a.remove();",
+    "        URL.revokeObjectURL(url);",
+    "        ok('Готово! CSV скачан: ' + filename);",
+    "      } catch(e) {",
+    "        err(String(e.message || e));",
+    "      } finally {",
+    "        btn.disabled = !(input.files && input.files[0]);",
+    "      }",
+    "    });",
+    "  </script>",
+    "</body>",
+    "</html>",
+])
 
-    <div class="row">
-      <input id="pdf" type="file" accept="application/pdf,.pdf" />
-      <button id="btn" class="primary" disabled>Получить CSV</button>
-    </div>
 
-    <div id="status" class="status"></div>
-  </d
+# -------------------------
+# ROUTES
+# -------------------------
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+@app.api_route("/", methods=["GET", "HEAD"], response_class=HTMLResponse)
+def home():
+    return HOME_HTML
+
+
+@app.post("/extract")
+async def extract(file: UploadFile = File(...)):
+    if not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Загрузите PDF файл (.pdf).")
+
+    pdf_bytes = await file.read()
+
+    try:
+        rows = extract_items_from_pdf(pdf_bytes)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Не удалось распарсить PDF: {e}")
+
+    if not rows:
+        raise HTTPException(status_code=422, detail="Не удалось найти таблицу товаров и количества в PDF.")
+
+    csv_bytes = make_csv_cp1251(rows)
+    return Response(
+        content=csv_bytes,
+        media_type="text/csv; charset=windows-1251",
+        headers={"Content-Disposition": 'attachment; filename=\"items.csv\"'},
+    )
