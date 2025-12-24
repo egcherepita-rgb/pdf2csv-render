@@ -1,97 +1,205 @@
 import io
 import re
 from collections import OrderedDict
-from typing import List, Tuple, Optional
+from typing import List, Tuple
 
 import fitz  # PyMuPDF
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import Response, HTMLResponse
 
 
-app = FastAPI(title="PDF → CSV (товар / кол-во)", version="1.5.3")
+app = FastAPI(title="PDF → CSV (товар / кол-во)", version="2.0.0")
 
-RX_INT = re.compile(r"^\d+$")
-RX_DIM = re.compile(r"^\d{2,}[xх]\d{2,}([xх]\d{1,})?$", re.IGNORECASE)  # 950x48x9 / 1250x25x25
+# --- regex ---
+RX_DIM = re.compile(r"\b\d{2,}[xх]\d{2,}(?:[xх]\d{1,})?\b", re.IGNORECASE)  # 950x48x9 / 25x2008x25
+RX_KG = re.compile(r"\b\d+(?:[.,]\d+)?\s*кг\.?\b", re.IGNORECASE)
+RX_RUB = re.compile(r"₽")
+RX_MMRU = re.compile(r"\bмм\b", re.IGNORECASE)
 
+# В строке деталей всегда есть "мм" и минимум 2 знака ₽
+def is_detail_line(s: str) -> bool:
+    return bool(RX_MMRU.search(s)) and (s.count("₽") >= 2)
 
-# -------------------------
-# helpers
-# -------------------------
+def normalize_space(s: str) -> str:
+    s = (s or "").replace("\u00a0", " ")
+    s = re.sub(r"\s+", " ", s)
+    return s.strip()
 
-def normalize_text(text: str) -> str:
-    text = text.replace("\u00a0", " ")
-    text = re.sub(r"\s+", " ", text)
-    return text.strip()
+def split_lines(page: fitz.Page) -> List[str]:
+    txt = page.get_text("text") or ""
+    lines = [normalize_space(x) for x in txt.splitlines()]
+    return [x for x in lines if x]
 
-
-def norm_token(s: str) -> str:
+def detect_table_start(lines: List[str]) -> bool:
     """
-    Нормализуем дефисы и регистр, чтобы "Кол-во" == "Кол-во" и т.п.
+    В твоих PDF заголовок бывает либо одной строкой:
+      "Фото Товар Габариты Вес Цена за шт Кол-во Сумма"
+    либо может быть разбит.
+    Поэтому ищем наличие ключевых слов в первых ~15 строках страницы.
     """
-    s = (s or "").strip().lower()
-    s = s.replace("-", "-").replace("–", "-").replace("—", "-")
-    return s
+    head = " ".join(lines[:20]).lower()
+    head = head.replace("–", "-").replace("—", "-")
+    # достаточно "фото", "товар", "кол-во/кол-ва/колво" и "сумма"
+    return ("фото" in head) and ("товар" in head) and ("сумма" in head) and (
+        ("кол-во" in head) or ("кол-ва" in head) or ("колво" in head) or ("кол во" in head)
+    )
 
+def is_footer_or_noise(line: str) -> bool:
+    low = line.lower()
+    if low.startswith("страница:"):
+        return True
+    if "развертка стены" in low:
+        return True
+    if "ваш проект" in low or "проект создан" in low:
+        return True
+    return False
 
-def find_word_any(words: list, variants: List[str]) -> Optional[tuple]:
-    vset = {norm_token(v) for v in variants}
-    for w in words:
-        if norm_token(w[4]) in vset:
-            return w
-    return None
+def is_totals_block_start(line: str) -> bool:
+    low = line.lower()
+    # после таблицы в твоих PDF идёт это
+    return (
+        low.startswith("общий вес")
+        or low.startswith("максимальный габарит")
+        or low.startswith("адрес:")
+        or low.startswith("телефон:")
+        or low.startswith("email")
+        or low.startswith("praktik-home")
+    )
 
+def is_project_total_only(line: str) -> bool:
+    # строка вида "63376 ₽" (без других символов)
+    s = normalize_space(line)
+    return bool(re.fullmatch(r"\d+\s*₽", s))
 
-def find_footer_cutoff_y(words: list, page_height: float) -> float:
+def extract_qty_from_detail_line(line: str) -> int:
     """
-    Отрезаем футер "Страница: X из Y", чтобы он не прилипал к последней строке.
+    Самый устойчивый способ для твоего формата:
+    берём сегмент между последними двумя "₽":
+      "... 360.00 ₽ 3 1080 ₽" -> между ₽ и ₽: " 3 1080 " -> qty=3
     """
-    for w in words:
-        t = norm_token(w[4])
-        if t.startswith("страница"):
-            return float(w[1]) - 4.0
-    return page_height - 55.0
+    parts = line.split("₽")
+    if len(parts) < 3:
+        raise ValueError("not enough ₽")
+    mid = parts[-2]
+    nums = re.findall(r"\d+", mid)
+    if not nums:
+        raise ValueError("qty not found")
+    qty = int(nums[0])
+    if not (1 <= qty <= 500):
+        raise ValueError("qty out of range")
+    return qty
 
+def clean_name(name: str) -> str:
+    name = normalize_space(name)
+    # не тащим служебное
+    name = re.sub(r"^Фото\s*", "", name, flags=re.IGNORECASE).strip()
+    name = re.sub(r"^Товар\s*", "", name, flags=re.IGNORECASE).strip()
+    name = re.sub(r"Страница:.*$", "", name, flags=re.IGNORECASE).strip()
+    return name
 
-def compute_layout_from_header(words: list) -> Optional[dict]:
+def maybe_add_inline_prefix_from_detail(line: str, name_buf: List[str]) -> None:
     """
-    Ищем шапку таблицы:
-      Фото | Товар | Габариты | ... | Кол-во | Сумма
+    Иногда часть названия идёт в строке деталей ДО габаритов, например:
+    "Стойка ПРАКТИК Home GS-200 белая 25x2008x25 мм ..."
 
-    Возвращаем:
-      header_bottom
-      name_left (после "Фото")
-      qty_left/qty_right (между "Кол-во" и "Сумма")
+    Тогда добавляем префикс до DIM в буфер названия.
     """
-    w_foto = find_word_any(words, ["Фото", "ФОТО"])
-    w_gab = find_word_any(words, ["Габариты", "ГАБАРИТЫ"])
-    w_qty = find_word_any(words, ["Кол-во", "Кол-во", "Кол–во", "Кол—во", "Колво", "Кол-ва"])
-    w_sum = find_word_any(words, ["Сумма", "СУММА"])
+    m = RX_DIM.search(line)
+    if not m:
+        return
+    prefix = clean_name(line[:m.start()])
+    if not prefix:
+        return
+    # не дублируем
+    if not name_buf or (name_buf and prefix not in name_buf):
+        name_buf.append(prefix)
 
-    if not (w_foto and w_gab and w_qty and w_sum):
-        return None
+def extract_items_from_pdf(pdf_bytes: bytes) -> List[Tuple[str, int]]:
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
 
-    header_bottom = float(max(w_foto[3], w_gab[3], w_qty[3], w_sum[3]))
+    ordered = OrderedDict()  # name -> qty (сохранение порядка)
+    in_table = False
+    name_buf: List[str] = []
 
-    name_left = float(w_foto[2]) + 4.0
-    qty_left = float(w_qty[0]) - 4.0
-    qty_right = float(w_sum[0]) - 4.0
+    for page in doc:
+        lines = split_lines(page)
+        if not lines:
+            continue
 
-    if qty_right <= qty_left:
-        return None
+        # детект шапки (в т.ч. когда она на этой странице)
+        if detect_table_start(lines):
+            in_table = True
+            name_buf = []
+            # не продолжаем — просто даём обработке идти дальше по строкам этой же страницы
 
-    return {
-        "header_bottom": header_bottom,
-        "name_left": name_left,
-        "qty_left": qty_left,
-        "qty_right": qty_right,
-    }
+        if not in_table:
+            continue
 
+        for line in lines:
+            if not line:
+                continue
+
+            if is_footer_or_noise(line):
+                continue
+
+            if is_totals_block_start(line):
+                in_table = False
+                name_buf = []
+                break
+
+            if is_project_total_only(line):
+                # после этого обычно сразу итоги; заканчиваем таблицу
+                in_table = False
+                name_buf = []
+                break
+
+            if is_detail_line(line):
+                # 1) qty
+                try:
+                    qty = extract_qty_from_detail_line(line)
+                except Exception:
+                    name_buf = []
+                    continue
+
+                # 2) добираем часть названия, если она внутри этой же строки до DIM
+                maybe_add_inline_prefix_from_detail(line, name_buf)
+
+                # 3) итоговое имя
+                name = clean_name(" ".join(name_buf))
+                name_buf = []
+
+                # отсекаем мусор
+                low = name.lower()
+                if not name:
+                    continue
+                if "стоимость проекта" in low:
+                    continue
+                if "развертка стены" in low:
+                    continue
+
+                # 4) пишем в OrderedDict (суммируем повторы)
+                if name in ordered:
+                    ordered[name] += qty
+                else:
+                    ordered[name] = qty
+
+                continue
+
+            # обычная строка: часть наименования (переносы)
+            # не копим строки с заголовками таблицы
+            low = line.lower().replace("–", "-").replace("—", "-")
+            if ("фото" in low and "товар" in low and "сумма" in low) or ("кол-во" in low and "сумма" in low):
+                continue
+
+            name_buf.append(line)
+
+    return list(ordered.items())
 
 def make_csv_cp1251(rows: List[Tuple[str, int]]) -> bytes:
     out = io.StringIO()
     out.write("Товар;Кол-во\n")
     for name, qty in rows:
-        safe = name.replace('"', '""')
+        safe = (name or "").replace('"', '""')
         if ";" in safe or "\n" in safe:
             safe = f'"{safe}"'
         out.write(f"{safe};{qty}\n")
@@ -99,150 +207,8 @@ def make_csv_cp1251(rows: List[Tuple[str, int]]) -> bytes:
 
 
 # -------------------------
-# parsing
-# -------------------------
-
-def extract_rows_on_page(page: fitz.Page, layout: dict, header_present: bool) -> List[Tuple[str, int]]:
-    words = page.get_text("words")
-    if not words:
-        return []
-
-    hb = layout["header_bottom"] if header_present else 0.0
-    name_left = layout["name_left"]
-    qty_left, qty_right = layout["qty_left"], layout["qty_right"]
-
-    max_content_y = find_footer_cutoff_y(words, float(page.rect.height))
-
-    # 1) находим числа в колонке Кол-во
-    qty_cells = []
-    for w in words:
-        s = w[4] or ""
-        if not RX_INT.fullmatch(s):
-            continue
-
-        x0, y0 = float(w[0]), float(w[1])
-        if y0 <= hb + 1:
-            continue
-        if y0 >= max_content_y:
-            continue
-        if not (qty_left <= x0 <= qty_right):
-            continue
-
-        q = int(s)
-        if 1 <= q <= 500:
-            qty_cells.append(w)
-
-    if not qty_cells:
-        return []
-
-    qty_cells.sort(key=lambda w: (w[1], w[0]))
-    y_centers = [((float(w[1]) + float(w[3])) / 2.0) for w in qty_cells]
-
-    rows: List[Tuple[str, int]] = []
-
-    for i, qw in enumerate(qty_cells):
-        y = y_centers[i]
-
-        top = (y_centers[i - 1] + y) / 2.0 if i > 0 else max(hb + 2.0, y - 90.0)
-        bottom = (y + y_centers[i + 1]) / 2.0 if i < len(y_centers) - 1 else min(y + 220.0, max_content_y)
-        top = max(top, hb + 2.0)
-
-        # слова в полосе строки
-        band = []
-        for w in words:
-            x0, y0, y1 = float(w[0]), float(w[1]), float(w[3])
-            if y0 <= hb + 1 or y0 >= max_content_y:
-                continue
-            yc = (y0 + y1) / 2.0
-            if yc < top or yc > bottom:
-                continue
-            band.append(w)
-
-        # 2) если в строке есть "мм", то габариты начинаются с DIM-слова (950x48x9)
-        has_mm = any(norm_token(w[4]) == "мм" for w in band)
-        gab_x_min = None
-        if has_mm:
-            dim_xs = [float(w[0]) for w in band if RX_DIM.fullmatch((w[4] or "").strip())]
-            if dim_xs:
-                gab_x_min = min(dim_xs)
-
-        # Правая граница названия:
-        # - если нашли габариты -> до них
-        # - иначе -> до колонки кол-ва (это как раз лечит "Обувницу" на переносе)
-        right_limit = (gab_x_min - 3.0) if gab_x_min is not None else (qty_left - 8.0)
-
-        # 3) собираем название товара
-        name_words = []
-        for w in band:
-            x0 = float(w[0])
-            if x0 < name_left:
-                continue
-            if x0 >= right_limit:
-                continue
-
-            t = norm_token(w[4])
-            if t in {"мм", "кг", "кг."}:
-                continue
-            # отсекаем возможные прилипшие заголовки/футер
-            if t.startswith("страница"):
-                continue
-
-            name_words.append(w)
-
-        name_words.sort(key=lambda w: (w[1], w[0]))
-        name = normalize_text(" ".join(w[4] for w in name_words))
-
-        # чистка
-        low = name.lower()
-        if not name:
-            continue
-        if "стоимость проекта" in low or "развертка стены" in low:
-            continue
-
-        rows.append((name, int(qw[4])))
-
-    return rows
-
-
-def extract_items_from_pdf(pdf_bytes: bytes) -> List[Tuple[str, int]]:
-    """
-    Порядок как в PDF.
-    Повторы суммируем, но порядок сохраняем по первому появлению.
-    """
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-
-    layout = None
-    ordered = OrderedDict()  # name -> qty
-
-    for page in doc:
-        words = page.get_text("words")
-        if not words:
-            continue
-
-        new_layout = compute_layout_from_header(words)
-        header_present = False
-        if new_layout is not None:
-            layout = new_layout
-            header_present = True
-
-        if layout is None:
-            # таблица ещё не началась
-            continue
-
-        page_rows = extract_rows_on_page(page, layout, header_present=header_present)
-        for name, qty in page_rows:
-            if name in ordered:
-                ordered[name] += qty
-            else:
-                ordered[name] = qty
-
-    return list(ordered.items())
-
-
-# -------------------------
 # HTML (без triple quotes)
 # -------------------------
-
 HOME_HTML = "\n".join([
     "<!doctype html>",
     "<html lang='ru'>",
@@ -330,7 +296,6 @@ HOME_HTML = "\n".join([
 # -------------------------
 # routes
 # -------------------------
-
 @app.get("/health")
 def health():
     return {"status": "ok"}
