@@ -8,19 +8,29 @@ from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import Response, HTMLResponse
 
 
-app = FastAPI(title="PDF → CSV (товар / кол-во)", version="3.0.0")
+app = FastAPI(title="PDF → CSV (товар / кол-во)", version="3.1.0")
 
 # -------------------------
-# Regex / helpers
+# Regex
 # -------------------------
-RX_DIM = re.compile(r"\b\d{2,}[xх]\d{2,}(?:[xх]\d{1,})?\b", re.IGNORECASE)  # 650x48x9
-RX_MM = re.compile(r"\bмм\b", re.IGNORECASE)
-RX_RUB = re.compile(r"₽")
+RX_DIM_LINE = re.compile(r"\b\d{2,}[xх]\d{2,}(?:[xх]\d{1,})?\b.*\bмм\b", re.IGNORECASE)  # 650x48x9 мм
+RX_WEIGHT = re.compile(r"\b\d+(?:[.,]\d+)?\s*кг\.?\b", re.IGNORECASE)  # 0.4 кг.
+RX_PRICE = re.compile(r"\b\d+(?:[.,]\d+)\s*₽\b")  # 290.00 ₽ / 290,00 ₽
+RX_INT = re.compile(r"^\d+$")  # qty
+RX_SUM = re.compile(r"^\d+(?:[ \u00a0]\d{3})*\s*₽$")  # 290 ₽ / 1 080 ₽
+
 
 def normalize_space(s: str) -> str:
     s = (s or "").replace("\u00a0", " ")
     s = re.sub(r"\s+", " ", s)
     return s.strip()
+
+
+def split_lines(page: fitz.Page) -> List[str]:
+    txt = page.get_text("text") or ""
+    lines = [normalize_space(x) for x in txt.splitlines()]
+    return [x for x in lines if x]
+
 
 def is_noise(line: str) -> bool:
     low = (line or "").strip().lower()
@@ -32,11 +42,12 @@ def is_noise(line: str) -> bool:
         return True
     if "проект создан" in low:
         return True
-    if "стоимость проекта" in low:
-        return True
     if "развертка стены" in low:
         return True
+    if "стоимость проекта" in low:
+        return True
     return False
+
 
 def is_totals_block(line: str) -> bool:
     low = (line or "").strip().lower()
@@ -46,140 +57,146 @@ def is_totals_block(line: str) -> bool:
         or low.startswith("адрес:")
         or low.startswith("телефон:")
         or low.startswith("email")
-        or low.startswith("praktik-home")
     )
+
 
 def is_project_total_only(line: str) -> bool:
     # строка вида "63376 ₽"
     return bool(re.fullmatch(r"\d+\s*₽", normalize_space(line)))
 
-def is_header_line(line: str) -> bool:
+
+def is_header_token(line: str) -> bool:
     low = normalize_space(line).lower().replace("–", "-").replace("—", "-")
-    # шапка таблицы в 1.pdf: "Фото Товар Габариты Вес Цена за шт Кол-во Сумма"
-    return ("фото" in low and "товар" in low and "габариты" in low and "сумма" in low)
+    return low in {"фото", "товар", "габариты", "вес", "цена за шт", "кол-во", "сумма"}
 
-def looks_like_detail_line(line: str) -> bool:
-    # Строка деталей: обязательно содержит "мм" + "₽" и размер 650x48x9
-    if not (RX_MM.search(line) and RX_RUB.search(line) and RX_DIM.search(line)):
-        return False
-    # В норме минимум 2 знака ₽ (цена и сумма)
-    return line.count("₽") >= 2
 
-def extract_qty_from_detail_line(line: str) -> Optional[int]:
-    """
-    Надёжно для формата:
-      "... 360.00 ₽ 3 1080 ₽"
-    Берём сегмент между последними двумя "₽" -> там сначала qty, потом сумма.
-    """
-    parts = line.split("₽")
-    if len(parts) < 3:
-        return None
-    mid = parts[-2]  # между предпоследним и последним ₽
-    nums = re.findall(r"\d+", mid)
-    if not nums:
-        return None
-    qty = int(nums[0])
-    if 1 <= qty <= 500:
-        return qty
-    return None
-
-def prefix_name_from_detail_line(line: str) -> str:
-    """
-    Иногда часть названия стоит в той же строке, что и габариты:
-      "Стойка ... GS-200 белая 25x2008x25 мм ..."
-    Тогда берём текст ДО первого размера.
-    """
-    m = RX_DIM.search(line)
-    if not m:
-        return ""
-    return normalize_space(line[:m.start()])
-
-def clean_name(name: str) -> str:
-    name = normalize_space(name)
-    # убрать случайные слова шапки
+def clean_name(lines: List[str]) -> str:
+    name = normalize_space(" ".join(lines))
     name = re.sub(r"^Фото\s*", "", name, flags=re.IGNORECASE).strip()
     name = re.sub(r"^Товар\s*", "", name, flags=re.IGNORECASE).strip()
     return name
 
-def split_lines_from_page(page: fitz.Page) -> List[str]:
-    txt = page.get_text("text") or ""
-    lines = [normalize_space(x) for x in txt.splitlines()]
-    return [x for x in lines if x]
+
+def try_parse_item(lines: List[str], dim_idx: int, name_buf: List[str]) -> Tuple[Optional[Tuple[str, int]], int]:
+    """
+    dim_idx указывает на строку с габаритами (650x48x9 мм ...).
+    Ищем впереди: (вес?) -> цена -> qty -> сумма.
+    Возвращаем (item or None, next_index)
+    """
+    name = clean_name(name_buf)
+    name_buf.clear()
+
+    # окно после габаритов — в твоих PDF этого более чем достаточно
+    end = min(len(lines), dim_idx + 12)
+    i = dim_idx + 1
+
+    # вес опционально
+    if i < end and RX_WEIGHT.search(lines[i]):
+        i += 1
+
+    # цена
+    price_idx = None
+    for j in range(i, end):
+        if RX_PRICE.search(lines[j]):
+            price_idx = j
+            break
+    if price_idx is None:
+        return None, dim_idx + 1
+
+    # кол-во
+    qty_idx = None
+    for j in range(price_idx + 1, end):
+        if RX_INT.fullmatch(lines[j]):
+            qty_idx = j
+            break
+    if qty_idx is None:
+        return None, dim_idx + 1
+
+    qty = int(lines[qty_idx])
+    if not (1 <= qty <= 500):
+        return None, dim_idx + 1
+
+    # сумма (для next_i; если не найдём — всё равно считаем товар найденным)
+    sum_idx = None
+    for j in range(qty_idx + 1, end):
+        if "₽" in lines[j]:
+            sum_idx = j
+            break
+
+    # Если имя пустое (редко), пробуем взять 1–6 строк перед габаритами
+    if not name:
+        back = []
+        k = dim_idx - 1
+        while k >= 0 and len(back) < 7:
+            ln = lines[k]
+            if is_noise(ln) or is_totals_block(ln) or is_project_total_only(ln) or is_header_token(ln):
+                break
+            # стоп, если наткнулись на тех. строки
+            if RX_DIM_LINE.search(ln) or RX_WEIGHT.search(ln) or RX_PRICE.search(ln) or RX_INT.fullmatch(ln) or RX_SUM.fullmatch(ln):
+                break
+            back.append(ln)
+            k -= 1
+        back.reverse()
+        name = clean_name(back)
+
+    if not name:
+        return None, dim_idx + 1
+
+    next_i = (sum_idx + 1) if sum_idx is not None else (qty_idx + 1)
+    return (name, qty), max(next_i, dim_idx + 1)
 
 
-# -------------------------
-# Main parser (тот самый "рабочий", + фикс стыка страниц)
-# -------------------------
 def extract_items(pdf_bytes: bytes) -> List[Tuple[str, int]]:
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
 
-    ordered = OrderedDict()  # name -> qty (порядок первого появления сохраняется)
-    name_buf: List[str] = []  # копим строки названия, в т.ч. между страницами
+    ordered = OrderedDict()  # name -> qty
+    name_buf: List[str] = []  # НЕ сбрасываем на границе страниц (фикс стыков)
 
     in_totals = False
 
     for page in doc:
-        lines = split_lines_from_page(page)
+        lines = split_lines(page)
         if not lines:
             continue
 
-        for line in lines:
-            if is_noise(line):
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+
+            if is_noise(line) or is_header_token(line):
+                i += 1
                 continue
 
-            # остановка по блоку итогов
             if is_project_total_only(line) or is_totals_block(line):
                 in_totals = True
                 name_buf.clear()
+                i += 1
                 continue
+
             if in_totals:
+                i += 1
                 continue
 
-            # пропуск шапки
-            if is_header_line(line):
-                name_buf.clear()
+            if RX_DIM_LINE.search(line):
+                item, next_i = try_parse_item(lines, i, name_buf)
+                if item is not None:
+                    name, qty = item
+                    low = name.lower()
+                    if "стоимость проекта" not in low and "развертка стены" not in low and len(name) >= 3:
+                        if name in ordered:
+                            ordered[name] += qty
+                        else:
+                            ordered[name] = qty
+                    i = next_i
+                    continue
+
+                # не распарсили — идём дальше (буфер уже очищен в try_parse_item)
+                i += 1
                 continue
 
-            # ключ: строка деталей (мм + ₽ + размер)
-            if looks_like_detail_line(line):
-                qty = extract_qty_from_detail_line(line)
-                if qty is None:
-                    # если вдруг не распознали — сбросим буфер и пойдём дальше
-                    name_buf.clear()
-                    continue
-
-                inline_prefix = prefix_name_from_detail_line(line)
-
-                # Название = накопленное + inline-префикс (если есть)
-                parts = []
-                if name_buf:
-                    parts.append(" ".join(name_buf))
-                if inline_prefix:
-                    # если inline_prefix уже входит в name_buf, не дублируем
-                    if not parts or inline_prefix not in parts[-1]:
-                        parts.append(inline_prefix)
-
-                name = clean_name(" ".join(parts))
-                name_buf.clear()
-
-                if not name:
-                    continue
-
-                # страховка от мусора
-                low = name.lower()
-                if "стоимость проекта" in low or "развертка стены" in low:
-                    continue
-
-                if name in ordered:
-                    ordered[name] += qty
-                else:
-                    ordered[name] = qty
-
-                continue
-
-            # иначе — часть названия (переносы, в т.ч. на стыке страниц)
-            # Важно: НЕ сбрасываем name_buf на конце страницы — это и фиксит стык страниц
+            # иначе это часть названия (переносы, в т.ч. на следующую страницу)
             name_buf.append(line)
+            i += 1
 
     return list(ordered.items())
 
@@ -196,7 +213,7 @@ def make_csv_cp1251(rows: List[Tuple[str, int]]) -> bytes:
 
 
 # -------------------------
-# Simple UI
+# UI (без triple quotes)
 # -------------------------
 HOME_HTML = "\n".join([
     "<!doctype html>",
@@ -305,7 +322,7 @@ async def extract(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=f"Не удалось распарсить PDF: {e}")
 
     if not rows:
-        raise HTTPException(status_code=422, detail="Не удалось найти позиции (мм + ₽) в PDF.")
+        raise HTTPException(status_code=422, detail="Не удалось найти позиции по шаблону (габариты мм → цена ₽ → кол-во).")
 
     csv_bytes = make_csv_cp1251(rows)
     return Response(
