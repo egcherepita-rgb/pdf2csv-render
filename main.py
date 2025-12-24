@@ -8,35 +8,32 @@ from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import Response, HTMLResponse
 
 
-app = FastAPI(title="PDF → CSV (товар / кол-во)", version="2.3.0")
+app = FastAPI(title="PDF → CSV (товар / кол-во)", version="2.3.1")
 
-# -------------------------
-# Regex
-# -------------------------
 RX_DIM_LINE = re.compile(r"\b\d{2,}[xх]\d{2,}(?:[xх]\d{1,})?\b.*\bмм\b", re.IGNORECASE)
 RX_WEIGHT_LINE = re.compile(r"\b\d+(?:[.,]\d+)?\s*кг\.?\b", re.IGNORECASE)
-RX_PRICE_LINE = re.compile(r"\b\d+(?:[.,]\d+)\s*₽\b")  # 290.00 ₽ / 290,00 ₽
+RX_PRICE_LINE = re.compile(r"\b\d+(?:[.,]\d+)\s*₽\b")
 RX_INT = re.compile(r"^\d+$")
 RX_ANY_RUB = re.compile(r"₽")
-RX_SUM_LINE = re.compile(r"^\d+(?:[ \u00a0]\d{3})*\s*₽$")  # 8580 ₽ / 8 580 ₽
+RX_SUM_LINE = re.compile(r"^\d+(?:[ \u00a0]\d{3})*\s*₽$")
 
-# "Кол-во" может быть с разными дефисами
+
 def norm_token(s: str) -> str:
     s = (s or "").strip().lower()
     return s.replace("–", "-").replace("—", "-")
 
-# -------------------------
-# Utils
-# -------------------------
+
 def normalize_space(s: str) -> str:
     s = (s or "").replace("\u00a0", " ")
     s = re.sub(r"\s+", " ", s)
     return s.strip()
 
+
 def split_lines(page: fitz.Page) -> List[str]:
     txt = page.get_text("text") or ""
     lines = [normalize_space(x) for x in txt.splitlines()]
     return [x for x in lines if x]
+
 
 def is_footer_or_noise(line: str) -> bool:
     low = norm_token(line)
@@ -52,6 +49,7 @@ def is_footer_or_noise(line: str) -> bool:
         return True
     return False
 
+
 def is_end_block(line: str) -> bool:
     low = norm_token(line)
     return (
@@ -62,13 +60,15 @@ def is_end_block(line: str) -> bool:
         or low.startswith("email")
     )
 
+
 def is_project_total_only(line: str) -> bool:
-    # строка вида "63376 ₽"
     return bool(re.fullmatch(r"\d+\s*₽", normalize_space(line)))
+
 
 def is_header_token(line: str) -> bool:
     low = norm_token(line)
     return low in {"фото", "товар", "габариты", "вес", "цена за шт", "кол-во", "сумма"}
+
 
 def clean_name(lines: List[str]) -> str:
     name = normalize_space(" ".join(lines))
@@ -77,25 +77,20 @@ def clean_name(lines: List[str]) -> str:
     name = re.sub(r"Страница:.*$", "", name, flags=re.IGNORECASE).strip()
     return name
 
+
 # -------------------------
-# Parser A: line-chain (лучше для твоего PDF)
+# Parser A: line-chain
 # -------------------------
 def extract_item_after_dim(lines: List[str], dim_idx: int, name_buf: List[str]) -> Tuple[Optional[Tuple[str, int]], int]:
-    """
-    dim_idx — индекс строки с габаритами (есть мм и размер).
-    Ищем дальше: (вес опционально) -> цена -> qty -> сумма.
-    """
     name = clean_name(name_buf)
     name_buf.clear()
 
-    end = min(len(lines), dim_idx + 14)  # окно расширено
+    end = min(len(lines), dim_idx + 14)
     i = dim_idx + 1
 
-    # вес может быть отдельной строкой
     if i < end and RX_WEIGHT_LINE.search(lines[i]):
         i += 1
 
-    # цена
     price_idx = None
     for j in range(i, end):
         if RX_PRICE_LINE.search(lines[j]):
@@ -104,7 +99,6 @@ def extract_item_after_dim(lines: List[str], dim_idx: int, name_buf: List[str]) 
     if price_idx is None:
         return None, dim_idx + 1
 
-    # количество (отдельная строка-целое)
     qty_idx = None
     for j in range(price_idx + 1, end):
         if RX_INT.fullmatch(lines[j]):
@@ -117,14 +111,12 @@ def extract_item_after_dim(lines: List[str], dim_idx: int, name_buf: List[str]) 
     if not (1 <= qty <= 500):
         return None, dim_idx + 1
 
-    # сумма (не обязателен как условие, но используем для next_idx)
     sum_idx = None
     for j in range(qty_idx + 1, end):
         if "₽" in lines[j]:
             sum_idx = j
             break
 
-    # если имя пустое — пробуем взять 1–6 строк перед dim_idx
     if not name:
         back = []
         k = dim_idx - 1
@@ -146,6 +138,7 @@ def extract_item_after_dim(lines: List[str], dim_idx: int, name_buf: List[str]) 
     next_idx = (sum_idx + 1) if sum_idx is not None else (qty_idx + 1)
     return (name, qty), max(next_idx, dim_idx + 1)
 
+
 def parse_by_lines(doc: fitz.Document) -> Tuple[List[Tuple[str, int]], Dict[str, int]]:
     ordered = OrderedDict()
     name_buf: List[str] = []
@@ -158,7 +151,6 @@ def parse_by_lines(doc: fitz.Document) -> Tuple[List[Tuple[str, int]], Dict[str,
         if not lines:
             continue
 
-        # статистика
         for ln in lines:
             if RX_DIM_LINE.search(ln):
                 stats["dim"] += 1
@@ -198,14 +190,14 @@ def parse_by_lines(doc: fitz.Document) -> Tuple[List[Tuple[str, int]], Dict[str,
                 i += 1
                 continue
 
-            # часть названия (включая переносы между страницами)
             name_buf.append(line)
             i += 1
 
     return list(ordered.items()), stats
 
+
 # -------------------------
-# Parser B: coordinate fallback (если вдруг текст “плывёт”)
+# Parser B: coordinate fallback
 # -------------------------
 def find_word_any(words: list, variants: List[str]) -> Optional[tuple]:
     vset = {norm_token(v) for v in variants}
@@ -213,6 +205,7 @@ def find_word_any(words: list, variants: List[str]) -> Optional[tuple]:
         if norm_token(w[4]) in vset:
             return w
     return None
+
 
 def compute_layout_from_header(words: list) -> Optional[dict]:
     w_foto = find_word_any(words, ["Фото"])
@@ -232,11 +225,13 @@ def compute_layout_from_header(words: list) -> Optional[dict]:
 
     return {"header_bottom": header_bottom, "name_left": name_left, "qty_left": qty_left, "qty_right": qty_right}
 
+
 def find_footer_cutoff_y(words: list, page_height: float) -> float:
     for w in words:
         if norm_token(w[4]).startswith("страница"):
             return float(w[1]) - 4.0
     return page_height - 55.0
+
 
 def parse_by_coords(doc: fitz.Document) -> List[Tuple[str, int]]:
     ordered = OrderedDict()
@@ -261,7 +256,6 @@ def parse_by_coords(doc: fitz.Document) -> List[Tuple[str, int]]:
         qty_left, qty_right = layout["qty_left"], layout["qty_right"]
         max_y = find_footer_cutoff_y(words, float(page.rect.height))
 
-        # qty cells
         qty_cells = []
         for w in words:
             t = (w[4] or "").strip()
@@ -295,7 +289,6 @@ def parse_by_coords(doc: fitz.Document) -> List[Tuple[str, int]]:
                     continue
                 band.append(w)
 
-            # динамически режем название: если в строке есть "мм" и размер -> до него, иначе до qty_left
             has_mm = any(norm_token(w[4]) == "мм" for w in band)
             gab_x_min = None
             if has_mm:
@@ -333,9 +326,7 @@ def parse_by_coords(doc: fitz.Document) -> List[Tuple[str, int]]:
 
     return list(ordered.items())
 
-# -------------------------
-# CSV
-# -------------------------
+
 def make_csv_cp1251(rows: List[Tuple[str, int]]) -> bytes:
     out = io.StringIO()
     out.write("Товар;Кол-во\n")
@@ -346,9 +337,7 @@ def make_csv_cp1251(rows: List[Tuple[str, int]]) -> bytes:
         out.write(f"{safe};{qty}\n")
     return out.getvalue().encode("cp1251", errors="replace")
 
-# -------------------------
-# HTML (без triple quotes)
-# -------------------------
+
 HOME_HTML = "\n".join([
     "<!doctype html>",
     "<html lang='ru'>",
@@ -380,7 +369,7 @@ HOME_HTML = "\n".join([
     "    <div class='row'>",
     "      <input id='pdf' type='file' accept='application/pdf,.pdf' />",
     "      <button id='btn' class='primary' disabled>Получить CSV</button>",
-    "    "</div>",
+    "    </div>",
     "    <div id='status' class='status'></div>",
     "  </div>",
     "  <script>",
@@ -432,16 +421,16 @@ HOME_HTML = "\n".join([
     "</html>",
 ])
 
-# -------------------------
-# Routes
-# -------------------------
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
+
 @app.api_route("/", methods=["GET", "HEAD"], response_class=HTMLResponse)
 def home():
     return HOME_HTML
+
 
 @app.post("/extract")
 async def extract(file: UploadFile = File(...)):
@@ -455,10 +444,8 @@ async def extract(file: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Не удалось открыть PDF: {e}")
 
-    # 1) основной парсер (по строкам)
     rows, stats = parse_by_lines(doc)
 
-    # 2) fallback по координатам
     if not rows:
         rows = parse_by_coords(doc)
 
@@ -476,5 +463,5 @@ async def extract(file: UploadFile = File(...)):
     return Response(
         content=csv_bytes,
         media_type="text/csv; charset=windows-1251",
-        headers={"Content-Disposition": 'attachment; filename="items.csv"'},
+        headers={"Content-Disposition": 'attachment; filename=\"items.csv\"'},
     )
