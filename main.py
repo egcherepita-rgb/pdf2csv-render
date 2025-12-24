@@ -1,23 +1,25 @@
 import io
 import re
 from collections import OrderedDict
-from typing import List, Tuple, Dict, Optional
+from typing import List, Tuple, Dict
 
 import fitz  # PyMuPDF
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import Response, HTMLResponse
 
 
-app = FastAPI(title="PDF → CSV (товар / кол-во)", version="3.3.0")
+app = FastAPI(title="PDF → CSV (товар / кол-во)", version="3.4.0")
 
 # -------------------------
-# Regex
+# Regex (Render-safe)
 # -------------------------
 RX_SIZE = re.compile(r"\b\d{2,}[xх]\d{2,}(?:[xх]\d{1,})?\b", re.IGNORECASE)  # 650x48x9
-RX_MM = re.compile(r"мм", re.IGNORECASE)  # без \b (на Render часто “прилипает”)
+RX_MM = re.compile(r"мм", re.IGNORECASE)  # без \b
 RX_WEIGHT = re.compile(r"\b\d+(?:[.,]\d+)?\s*кг\.?\b", re.IGNORECASE)
-RX_PRICE = re.compile(r"\b\d+(?:[.,]\d+)\s*₽\b")  # 290.00 ₽ / 290,00 ₽
-RX_SUM = re.compile(r"^\d+(?:[ \u00a0]\d{3})*\s*₽$")  # 290 ₽ / 1 080 ₽
+
+# Денежная строка: "290 ₽", "290.00 ₽", "1 080 ₽", "1 080,50 ₽"
+RX_MONEY_LINE = re.compile(r"^\d+(?:[ \u00a0]\d{3})*(?:[.,]\d+)?\s*₽$")
+
 RX_INT = re.compile(r"^\d+$")
 RX_ANY_RUB = re.compile(r"₽")
 
@@ -72,7 +74,6 @@ def is_header_token(line: str) -> bool:
 
 
 def looks_like_dim_or_weight(line: str) -> bool:
-    # “650x48x9 мм …” или просто “мм”/размер/вес
     if RX_WEIGHT.search(line):
         return True
     if RX_SIZE.search(line) and RX_MM.search(line):
@@ -81,9 +82,7 @@ def looks_like_dim_or_weight(line: str) -> bool:
 
 
 def looks_like_money_or_qty(line: str) -> bool:
-    if RX_PRICE.search(line):
-        return True
-    if RX_SUM.fullmatch(line):
+    if RX_MONEY_LINE.fullmatch(line):
         return True
     if RX_INT.fullmatch(line):
         return True
@@ -91,18 +90,14 @@ def looks_like_money_or_qty(line: str) -> bool:
 
 
 def clean_name_from_buffer(buf: List[str]) -> str:
-    """
-    Берём накопленные строки и выкидываем из конца мусор:
-    габариты/вес/деньги/кол-во.
-    """
-    # уберём очевидные шапки/мусор внутри
+    # вычистим мусор
     filtered = []
     for ln in buf:
         if is_noise(ln) or is_header_token(ln) or is_totals_block(ln) or is_project_total_only(ln):
             continue
         filtered.append(ln)
 
-    # с конца выкидываем строки габаритов/веса/денег
+    # с конца убираем тех. строки: габариты/вес/деньги/кол-во
     while filtered and (looks_like_dim_or_weight(filtered[-1]) or looks_like_money_or_qty(filtered[-1])):
         filtered.pop()
 
@@ -112,25 +107,21 @@ def clean_name_from_buffer(buf: List[str]) -> str:
     return name
 
 
-def parse_items(pdf_bytes: bytes) -> Tuple[List[Tuple[str, int]], Dict[str, int]]:
-    """
-    Главный парсер: PRICE -> QTY -> SUM.
-    Габариты не нужны (только чистим ими буфер).
-    Буфер НЕ сбрасываем на границе страниц => фикс стыка страниц.
-    """
+def parse_items(pdf_bytes: bytes) -> Tuple[List[Tuple[str, int]], Dict]:
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
 
     ordered = OrderedDict()  # name -> qty
-    buf: List[str] = []
+    buf: List[str] = []      # НЕ сбрасываем на границе страниц
     in_totals = False
 
     stats = {
         "pages": 0,
-        "price_lines": 0,
-        "sum_lines": 0,
+        "money_lines": 0,
         "int_lines": 0,
         "rub_lines": 0,
         "items_found": 0,
+        "money_examples": [],
+        "int_examples": [],
     }
 
     for page in doc:
@@ -140,12 +131,14 @@ def parse_items(pdf_bytes: bytes) -> Tuple[List[Tuple[str, int]], Dict[str, int]
             continue
 
         for ln in lines:
-            if RX_PRICE.search(ln):
-                stats["price_lines"] += 1
-            if RX_SUM.fullmatch(ln):
-                stats["sum_lines"] += 1
+            if RX_MONEY_LINE.fullmatch(ln):
+                stats["money_lines"] += 1
+                if len(stats["money_examples"]) < 5:
+                    stats["money_examples"].append(ln)
             if RX_INT.fullmatch(ln):
                 stats["int_lines"] += 1
+                if len(stats["int_examples"]) < 5:
+                    stats["int_examples"].append(ln)
             if RX_ANY_RUB.search(ln):
                 stats["rub_lines"] += 1
 
@@ -167,9 +160,8 @@ def parse_items(pdf_bytes: bytes) -> Tuple[List[Tuple[str, int]], Dict[str, int]
                 i += 1
                 continue
 
-            # ЯКОРЬ: строка с ценой
-            if RX_PRICE.search(line):
-                # ищем qty и сумму в ближайших строках
+            # ЯКОРЬ: money -> qty -> money
+            if RX_MONEY_LINE.fullmatch(line):
                 end = min(len(lines), i + 10)
 
                 qty_idx = None
@@ -181,33 +173,38 @@ def parse_items(pdf_bytes: bytes) -> Tuple[List[Tuple[str, int]], Dict[str, int]
                             break
 
                 if qty_idx is None:
-                    # не собрали цепочку — цена может быть “мусором”, просто продолжаем
-                    buf.append(line)  # пусть будет в буфере, иногда цена идёт как часть блока
+                    # не нашли qty — пусть останется в буфере
+                    buf.append(line)
                     i += 1
                     continue
 
                 sum_idx = None
                 for j in range(qty_idx + 1, end):
-                    if RX_ANY_RUB.search(lines[j]):
+                    if RX_MONEY_LINE.fullmatch(lines[j]) or RX_ANY_RUB.search(lines[j]):
                         sum_idx = j
                         break
 
-                # Название берём из буфера (он содержит строки перед ценой)
+                # если суммы нет — всё равно часто можно считать, но лучше требовать хотя бы ₽ дальше
+                if sum_idx is None:
+                    buf.append(line)
+                    i += 1
+                    continue
+
                 name = clean_name_from_buffer(buf)
                 buf.clear()
 
                 if name:
+                    qty = int(lines[qty_idx])
                     if name in ordered:
-                        ordered[name] += int(lines[qty_idx])
+                        ordered[name] += qty
                     else:
-                        ordered[name] = int(lines[qty_idx])
+                        ordered[name] = qty
                     stats["items_found"] += 1
 
-                # прыгаем дальше (после суммы, если есть)
-                i = (sum_idx + 1) if sum_idx is not None else (qty_idx + 1)
+                i = sum_idx + 1
                 continue
 
-            # обычная строка — часть названия/описания (в т.ч. переносы между страницами)
+            # обычная строка -> в буфер
             buf.append(line)
             i += 1
 
@@ -332,10 +329,9 @@ async def extract(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=f"Не удалось распарсить PDF: {e}")
 
     if not rows:
-        # Всегда возвращаем отладку — чтобы не гонять 100 тестов
         raise HTTPException(
             status_code=422,
-            detail=f"Не удалось найти позиции по шаблону (цена ₽ → кол-во → сумма ₽). debug={stats}",
+            detail=f"Не удалось найти позиции по шаблону (деньги ₽ → кол-во → деньги ₽). debug={stats}",
         )
 
     csv_bytes = make_csv_cp1251(rows)
