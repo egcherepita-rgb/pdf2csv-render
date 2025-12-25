@@ -8,7 +8,7 @@ from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import Response, HTMLResponse
 
 
-app = FastAPI(title="PDF → CSV (товар / кол-во)", version="3.4.0")
+app = FastAPI(title="PDF → CSV (товар / кол-во)", version="3.4.1")
 
 # -------------------------
 # Regex (Render-safe)
@@ -22,6 +22,13 @@ RX_MONEY_LINE = re.compile(r"^\d+(?:[ \u00a0]\d{3})*(?:[.,]\d+)?\s*₽$")
 
 RX_INT = re.compile(r"^\d+$")
 RX_ANY_RUB = re.compile(r"₽")
+
+# Хвост габаритов в конце строки/названия:
+# " ... 8x16x418 мм" / "... 8x16 мм" / "... 8x16x418мм"
+RX_TRAILING_DIMS = re.compile(
+    r"(?:\s+|\s*\(\s*)\d{2,}[xх]\d{2,}(?:[xх]\d{1,})?\s*мм(?:\s*\))?\s*$",
+    re.IGNORECASE,
+)
 
 
 def normalize_space(s: str) -> str:
@@ -89,6 +96,21 @@ def looks_like_money_or_qty(line: str) -> bool:
     return False
 
 
+def strip_trailing_dims(name: str) -> str:
+    """
+    Удаляет прилипшие к названию габариты на хвосте:
+      "... графит 8x16x418 мм" -> "... графит"
+    """
+    name = normalize_space(name)
+    # срезаем пока есть (иногда бывает двойной хвост из-за переносов)
+    for _ in range(3):
+        new_name = RX_TRAILING_DIMS.sub("", name).strip()
+        if new_name == name:
+            break
+        name = new_name
+    return name
+
+
 def clean_name_from_buffer(buf: List[str]) -> str:
     # вычистим мусор
     filtered = []
@@ -104,10 +126,18 @@ def clean_name_from_buffer(buf: List[str]) -> str:
     name = normalize_space(" ".join(filtered))
     name = re.sub(r"^Фото\s*", "", name, flags=re.IGNORECASE).strip()
     name = re.sub(r"^Товар\s*", "", name, flags=re.IGNORECASE).strip()
+
+    # 🔥 ключевая правка: вырезаем прилипшие размеры в конце названия
+    name = strip_trailing_dims(name)
+
     return name
 
 
 def parse_items(pdf_bytes: bytes) -> Tuple[List[Tuple[str, int]], Dict]:
+    """
+    Главный парсер: money -> qty -> money.
+    Буфер НЕ сбрасываем на границе страниц => фикс стыка страниц.
+    """
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
 
     ordered = OrderedDict()  # name -> qty
@@ -173,18 +203,17 @@ def parse_items(pdf_bytes: bytes) -> Tuple[List[Tuple[str, int]], Dict]:
                             break
 
                 if qty_idx is None:
-                    # не нашли qty — пусть останется в буфере
                     buf.append(line)
                     i += 1
                     continue
 
                 sum_idx = None
                 for j in range(qty_idx + 1, end):
+                    # сумма почти всегда как money-строка
                     if RX_MONEY_LINE.fullmatch(lines[j]) or RX_ANY_RUB.search(lines[j]):
                         sum_idx = j
                         break
 
-                # если суммы нет — всё равно часто можно считать, но лучше требовать хотя бы ₽ дальше
                 if sum_idx is None:
                     buf.append(line)
                     i += 1
@@ -204,7 +233,6 @@ def parse_items(pdf_bytes: bytes) -> Tuple[List[Tuple[str, int]], Dict]:
                 i = sum_idx + 1
                 continue
 
-            # обычная строка -> в буфер
             buf.append(line)
             i += 1
 
