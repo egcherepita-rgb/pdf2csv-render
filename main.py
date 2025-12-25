@@ -8,13 +8,13 @@ from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import Response, HTMLResponse
 
 
-app = FastAPI(title="PDF → CSV (товар / кол-во)", version="3.4.1")
+app = FastAPI(title="PDF → CSV (товар / кол-во)", version="3.4.2")
 
 # -------------------------
 # Regex (Render-safe)
 # -------------------------
-RX_SIZE = re.compile(r"\b\d{2,}[xх]\d{2,}(?:[xх]\d{1,})?\b", re.IGNORECASE)  # 650x48x9
-RX_MM = re.compile(r"мм", re.IGNORECASE)  # без \b
+RX_SIZE = re.compile(r"\b\d{2,}[xх×]\d{2,}(?:[xх×]\d{1,})?\b", re.IGNORECASE)  # 650x48x9 / 8×16×418
+RX_MM = re.compile(r"мм", re.IGNORECASE)  # без \b (может прилипать)
 RX_WEIGHT = re.compile(r"\b\d+(?:[.,]\d+)?\s*кг\.?\b", re.IGNORECASE)
 
 # Денежная строка: "290 ₽", "290.00 ₽", "1 080 ₽", "1 080,50 ₽"
@@ -23,10 +23,9 @@ RX_MONEY_LINE = re.compile(r"^\d+(?:[ \u00a0]\d{3})*(?:[.,]\d+)?\s*₽$")
 RX_INT = re.compile(r"^\d+$")
 RX_ANY_RUB = re.compile(r"₽")
 
-# Хвост габаритов в конце строки/названия:
-# " ... 8x16x418 мм" / "... 8x16 мм" / "... 8x16x418мм"
-RX_TRAILING_DIMS = re.compile(
-    r"(?:\s+|\s*\(\s*)\d{2,}[xх]\d{2,}(?:[xх]\d{1,})?\s*мм(?:\s*\))?\s*$",
+# Любые габариты внутри строки: "8x16x418 мм", "8х16×418мм", "8×16×418 мм."
+RX_DIMS_ANYWHERE = re.compile(
+    r"\s*\d{1,4}[xх×]\d{1,4}(?:[xх×]\d{1,5})?\s*мм\.?\s*",
     re.IGNORECASE,
 )
 
@@ -96,19 +95,16 @@ def looks_like_money_or_qty(line: str) -> bool:
     return False
 
 
-def strip_trailing_dims(name: str) -> str:
+def strip_dims_anywhere(name: str) -> str:
     """
-    Удаляет прилипшие к названию габариты на хвосте:
-      "... графит 8x16x418 мм" -> "... графит"
+    Удаляет габариты вида '8x16x418 мм' даже если они:
+    - внутри строки
+    - с символом ×
+    - без пробела перед мм
     """
     name = normalize_space(name)
-    # срезаем пока есть (иногда бывает двойной хвост из-за переносов)
-    for _ in range(3):
-        new_name = RX_TRAILING_DIMS.sub("", name).strip()
-        if new_name == name:
-            break
-        name = new_name
-    return name
+    name2 = RX_DIMS_ANYWHERE.sub(" ", name)
+    return normalize_space(name2)
 
 
 def clean_name_from_buffer(buf: List[str]) -> str:
@@ -127,8 +123,8 @@ def clean_name_from_buffer(buf: List[str]) -> str:
     name = re.sub(r"^Фото\s*", "", name, flags=re.IGNORECASE).strip()
     name = re.sub(r"^Товар\s*", "", name, flags=re.IGNORECASE).strip()
 
-    # 🔥 ключевая правка: вырезаем прилипшие размеры в конце названия
-    name = strip_trailing_dims(name)
+    # КЛЮЧЕВОЕ: вырезаем габариты "…мм" даже если они в середине/конце строки
+    name = strip_dims_anywhere(name)
 
     return name
 
@@ -209,7 +205,6 @@ def parse_items(pdf_bytes: bytes) -> Tuple[List[Tuple[str, int]], Dict]:
 
                 sum_idx = None
                 for j in range(qty_idx + 1, end):
-                    # сумма почти всегда как money-строка
                     if RX_MONEY_LINE.fullmatch(lines[j]) or RX_ANY_RUB.search(lines[j]):
                         sum_idx = j
                         break
