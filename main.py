@@ -15,7 +15,7 @@ except Exception:
     openpyxl = None
 
 
-app = FastAPI(title="PDF → CSV (артикул / наименование / всего / категория)", version="3.5.3")
+app = FastAPI(title="PDF → CSV (артикул / наименование / всего / категория)", version="3.6.0")
 
 # -------------------------
 # Regex (Render-safe)
@@ -279,20 +279,30 @@ def parse_items(pdf_bytes: bytes) -> Tuple[List[Tuple[str, int]], Dict]:
 
 
 # -------------------------
-# CSV output (comma-separated)
+# CSV output (exact Excel-friendly format)
+# - delimiter: ;
+# - encoding: UTF-8 with BOM
+# - newlines: CRLF
 # -------------------------
-def make_csv_cp1251(rows: List[Tuple[str, int]]) -> bytes:
+def make_csv_excel_friendly(rows: List[Tuple[str, int]]) -> bytes:
     out = io.StringIO()
-    writer = csv.writer(out, delimiter=",", quotechar='"', quoting=csv.QUOTE_MINIMAL, lineterminator="\n")
+    writer = csv.writer(
+        out,
+        delimiter=";",
+        quotechar='"',
+        quoting=csv.QUOTE_MINIMAL,
+        lineterminator="\r\n",
+    )
 
-    # Заголовки по требованию: Категория ПОСЛЕДНЯЯ
+    # Заголовки: Категория ПОСЛЕДНЯЯ
     writer.writerow(["Артикул", "Наименование", "Всего", "Категория"])
 
     for name, qty in rows:
         art = ARTICLE_MAP.get(normalize_key(name), "")
         writer.writerow([art, name, qty, CATEGORY_VALUE])
 
-    return out.getvalue().encode("cp1251", errors="replace")
+    # UTF-8 with BOM for Excel
+    return out.getvalue().encode("utf-8-sig")
 
 
 # -------------------------
@@ -324,8 +334,8 @@ HOME_HTML = "\n".join([
     "<body>",
     "  <div class='card'>",
     "    <h1>PDF → CSV</h1>",
-    "    <p>Выходной CSV: <b>Артикул</b>, <b>Наименование</b>, <b>Всего</b>, <b>Категория</b>.</p>",
-    "    <p class='hint'>Категория всегда = <b>2</b>. CSV: кодировка <b>Windows-1251</b>, разделитель <b>,</b>. Артикулы из <b>Art.xlsx</b>.</p>",
+    "    <p>Выходной CSV: <b>Артикул</b>; <b>Наименование</b>; <b>Всего</b>; <b>Категория</b>.</p>",
+    "    <p class='hint'>Формат как в примере: <b>;</b> + <b>UTF-8 BOM</b> + <b>CRLF</b>. Категория всегда = <b>2</b>. Артикулы из <b>Art.xlsx</b>.</p>",
     "    <div class='row'>",
     "      <input id='pdf' type='file' accept='application/pdf,.pdf' />",
     "      <button id='btn' class='primary' disabled>Получить CSV</button>",
@@ -389,6 +399,7 @@ def health():
         "article_map_size": len(ARTICLE_MAP),
         "article_map_status": ARTICLE_MAP_STATUS,
         "category_value": CATEGORY_VALUE,
+        "csv_format": "semicolon + utf-8-sig + crlf",
     }
 
 
@@ -415,9 +426,9 @@ async def extract(file: UploadFile = File(...)):
             detail=f"Не удалось найти позиции по шаблону (деньги ₽ → кол-во → деньги ₽). debug={stats}",
         )
 
-    csv_bytes = make_csv_cp1251(rows)
+    csv_bytes = make_csv_excel_friendly(rows)
     return Response(
         content=csv_bytes,
-        media_type="text/csv; charset=windows-1251",
+        media_type="text/csv; charset=utf-8",
         headers={"Content-Disposition": 'attachment; filename="items.csv"'},
     )
