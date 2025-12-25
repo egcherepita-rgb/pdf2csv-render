@@ -15,10 +15,10 @@ except Exception:
     openpyxl = None
 
 
-app = FastAPI(title="PDF → CSV (артикул / наименование / всего / категория)", version="3.6.0")
+app = FastAPI(title="PDF → CSV (артикул / наименование / всего / категория)", version="3.6.1")
 
 # -------------------------
-# Regex (Render-safe)
+# Regex
 # -------------------------
 RX_SIZE = re.compile(r"\b\d{2,}[xх×]\d{2,}(?:[xх×]\d{1,})?\b", re.IGNORECASE)
 RX_MM = re.compile(r"мм", re.IGNORECASE)
@@ -97,7 +97,6 @@ def load_article_map() -> Tuple[Dict[str, str], str]:
 
 ARTICLE_MAP, ARTICLE_MAP_STATUS = load_article_map()
 
-# Категория по требованию — всегда "2"
 CATEGORY_VALUE = 2
 
 
@@ -181,10 +180,6 @@ def clean_name_from_buffer(buf: List[str]) -> str:
 
 
 def parse_items(pdf_bytes: bytes) -> Tuple[List[Tuple[str, int]], Dict]:
-    """
-    Парсер: money -> qty -> money.
-    Буфер НЕ сбрасываем на границе страниц => фикс стыка страниц.
-    """
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
 
     ordered = OrderedDict()
@@ -207,14 +202,6 @@ def parse_items(pdf_bytes: bytes) -> Tuple[List[Tuple[str, int]], Dict]:
         if not lines:
             continue
 
-        for ln in lines:
-            if RX_MONEY_LINE.fullmatch(ln):
-                stats["money_lines"] += 1
-            if RX_INT.fullmatch(ln):
-                stats["int_lines"] += 1
-            if RX_ANY_RUB.search(ln):
-                stats["rub_lines"] += 1
-
         i = 0
         while i < len(lines):
             line = lines[i]
@@ -233,7 +220,7 @@ def parse_items(pdf_bytes: bytes) -> Tuple[List[Tuple[str, int]], Dict]:
                 i += 1
                 continue
 
-            # ЯКОРЬ: money -> qty -> money
+            # anchor: money -> qty -> money
             if RX_MONEY_LINE.fullmatch(line):
                 end = min(len(lines), i + 10)
 
@@ -279,10 +266,7 @@ def parse_items(pdf_bytes: bytes) -> Tuple[List[Tuple[str, int]], Dict]:
 
 
 # -------------------------
-# CSV output (exact Excel-friendly format)
-# - delimiter: ;
-# - encoding: UTF-8 with BOM
-# - newlines: CRLF
+# CSV output (Excel-friendly)
 # -------------------------
 def make_csv_excel_friendly(rows: List[Tuple[str, int]]) -> bytes:
     out = io.StringIO()
@@ -294,19 +278,17 @@ def make_csv_excel_friendly(rows: List[Tuple[str, int]]) -> bytes:
         lineterminator="\r\n",
     )
 
-    # Заголовки: Категория ПОСЛЕДНЯЯ
     writer.writerow(["Артикул", "Наименование", "Всего", "Категория"])
 
     for name, qty in rows:
         art = ARTICLE_MAP.get(normalize_key(name), "")
         writer.writerow([art, name, qty, CATEGORY_VALUE])
 
-    # UTF-8 with BOM for Excel
-    return out.getvalue().encode("utf-8-sig")
+    return out.getvalue().encode("utf-8-sig")  # UTF-8 BOM
 
 
 # -------------------------
-# UI
+# Minimal красивый UI
 # -------------------------
 HOME_HTML = "\n".join([
     "<!doctype html>",
@@ -316,31 +298,44 @@ HOME_HTML = "\n".join([
     "  <meta name='viewport' content='width=device-width, initial-scale=1' />",
     "  <title>PDF → CSV</title>",
     "  <style>",
-    "    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; padding: 24px; background:#fafafa; }",
-    "    .card { max-width: 860px; margin: 0 auto; background:#fff; border: 1px solid #e5e5e5; border-radius: 14px; padding: 22px; }",
-    "    h1 { margin: 0 0 10px; font-size: 28px; }",
-    "    p { margin: 8px 0; color:#333; }",
-    "    .row { display:flex; gap: 12px; flex-wrap: wrap; align-items: center; margin-top: 14px; }",
-    "    input[type=file] { padding: 10px; border: 1px solid #ddd; border-radius: 10px; background:#fff; }",
-    "    button { padding: 10px 14px; border: 0; border-radius: 10px; cursor: pointer; font-weight: 600; }",
-    "    button.primary { background: #111; color: #fff; }",
-    "    button.primary:disabled { opacity: .55; cursor:not-allowed; }",
-    "    .status { margin-top: 12px; font-size: 14px; white-space: pre-wrap; }",
-    "    .ok { color: #0a7a2f; }",
-    "    .err { color: #b00020; }",
-    "    .hint { color:#666; font-size: 14px; }",
+    "    :root { --bg:#0b0f17; --card:#121a2a; --text:#e9eefc; --muted:#a8b3d6; --border:rgba(255,255,255,.08); --btn:#4f7cff; }",
+    "    body { margin:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; background: radial-gradient(1200px 600px at 20% 10%, #18234a 0%, var(--bg) 55%); color: var(--text); }",
+    "    .wrap { min-height: 100vh; display:flex; align-items:center; justify-content:center; padding: 28px; }",
+    "    .card { width:min(760px, 100%); background: rgba(18,26,42,.92); border: 1px solid var(--border); border-radius: 18px; padding: 22px; box-shadow: 0 18px 60px rgba(0,0,0,.45); }",
+    "    .top { display:flex; gap:14px; align-items:center; justify-content:space-between; flex-wrap:wrap; }",
+    "    h1 { margin:0; font-size: 28px; letter-spacing: .2px; }",
+    "    .badge { font-size: 12px; color: var(--muted); border: 1px solid var(--border); padding: 6px 10px; border-radius: 999px; }",
+    "    .hint { margin: 8px 0 0; color: var(--muted); font-size: 14px; }",
+    "    .row { margin-top: 18px; display:flex; gap: 12px; align-items:center; flex-wrap:wrap; }",
+    "    .file { position: relative; display:flex; align-items:center; gap:10px; padding: 10px 12px; border: 1px dashed var(--border); border-radius: 14px; background: rgba(255,255,255,.02); }",
+    "    .file input { max-width: 340px; }",
+    "    button { padding: 10px 14px; border: 0; border-radius: 14px; cursor: pointer; font-weight: 700; background: var(--btn); color: #0b1020; }",
+    "    button:disabled { opacity: .55; cursor:not-allowed; }",
+    "    .status { margin-top: 14px; font-size: 14px; color: var(--muted); white-space: pre-wrap; }",
+    "    .status.ok { color: #79ffa8; }",
+    "    .status.err { color: #ff7b8a; }",
+    "    .footer { margin-top: 14px; color: rgba(168,179,214,.75); font-size: 12px; }",
     "  </style>",
     "</head>",
     "<body>",
-    "  <div class='card'>",
-    "    <h1>PDF → CSV</h1>",
-    "    <p>Выходной CSV: <b>Артикул</b>; <b>Наименование</b>; <b>Всего</b>; <b>Категория</b>.</p>",
-    "    <p class='hint'>Формат как в примере: <b>;</b> + <b>UTF-8 BOM</b> + <b>CRLF</b>. Категория всегда = <b>2</b>. Артикулы из <b>Art.xlsx</b>.</p>",
-    "    <div class='row'>",
-    "      <input id='pdf' type='file' accept='application/pdf,.pdf' />",
-    "      <button id='btn' class='primary' disabled>Получить CSV</button>",
+    "  <div class='wrap'>",
+    "    <div class='card'>",
+    "      <div class='top'>",
+    "        <div>",
+    "          <h1>PDF → CSV</h1>",
+    "          <div class='hint'>Загрузите PDF и скачайте CSV.</div>",
+    "        </div>",
+    "        <div class='badge'>Формат: ; • UTF-8 • Excel</div>",
+    "      </div>",
+    "      <div class='row'>",
+    "        <div class='file'>",
+    "          <input id='pdf' type='file' accept='application/pdf,.pdf' />",
+    "        </div>",
+    "        <button id='btn' disabled>Скачать CSV</button>",
+    "      </div>",
+    "      <div id='status' class='status'></div>",
+    "      <div class='footer'>Выходные колонки: Артикул; Наименование; Всего; Категория (Категория = 2).</div>",
     "    </div>",
-    "    <div id='status' class='status'></div>",
     "  </div>",
     "  <script>",
     "    const input = document.getElementById('pdf');",
@@ -358,7 +353,7 @@ HOME_HTML = "\n".join([
     "      const f = input.files && input.files[0];",
     "      if (!f) return;",
     "      btn.disabled = true;",
-    "      neutral('Обработка PDF…');",
+    "      neutral('Обработка…');",
     "      try {",
     "        const fd = new FormData();",
     "        fd.append('file', f);",
@@ -366,7 +361,7 @@ HOME_HTML = "\n".join([
     "        if (!resp.ok) {",
     "          let text = await resp.text();",
     "          try { const j = JSON.parse(text); if (j.detail) text = String(j.detail); } catch(e) {}",
-    "          throw new Error('Ошибка ' + resp.status + ': ' + text);",
+    "          throw new Error(text || ('HTTP ' + resp.status));",
     "        }",
     "        const blob = await resp.blob();",
     "        const base = (f.name || 'items.pdf').replace(/\\.pdf$/i, '');",
@@ -379,9 +374,9 @@ HOME_HTML = "\n".join([
     "        a.click();",
     "        a.remove();",
     "        URL.revokeObjectURL(url);",
-    "        ok('Готово! CSV скачан: ' + filename);",
+    "        ok('Готово! Файл скачан: ' + filename);",
     "      } catch(e) {",
-    "        err(String(e.message || e));",
+    "        err('Ошибка: ' + String(e.message || e));",
     "      } finally {",
     "        btn.disabled = !(input.files && input.files[0]);",
     "      }",
@@ -399,7 +394,6 @@ def health():
         "article_map_size": len(ARTICLE_MAP),
         "article_map_status": ARTICLE_MAP_STATUS,
         "category_value": CATEGORY_VALUE,
-        "csv_format": "semicolon + utf-8-sig + crlf",
     }
 
 
