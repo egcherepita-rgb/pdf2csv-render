@@ -3,30 +3,31 @@ import os
 import re
 import csv
 from collections import OrderedDict
-from typing import List, Tuple, Dict, Optional
+from typing import List, Tuple, Dict
 
 import fitz  # PyMuPDF
-import openpyxl
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import Response, HTMLResponse
 
+try:
+    import openpyxl  # requires openpyxl in requirements.txt
+except Exception:
+    openpyxl = None
 
-app = FastAPI(title="PDF → CSV (артикул / товар / кол-во)", version="3.5.0")
+
+app = FastAPI(title="PDF → CSV (артикул / товар / кол-во)", version="3.5.1")
 
 # -------------------------
 # Regex (Render-safe)
 # -------------------------
-RX_SIZE = re.compile(r"\b\d{2,}[xх×]\d{2,}(?:[xх×]\d{1,})?\b", re.IGNORECASE)  # 650x48x9 / 8×16×418
-RX_MM = re.compile(r"мм", re.IGNORECASE)  # без \b (может прилипать)
+RX_SIZE = re.compile(r"\b\d{2,}[xх×]\d{2,}(?:[xх×]\d{1,})?\b", re.IGNORECASE)
+RX_MM = re.compile(r"мм", re.IGNORECASE)
 RX_WEIGHT = re.compile(r"\b\d+(?:[.,]\d+)?\s*кг\.?\b", re.IGNORECASE)
 
-# Денежная строка: "290 ₽", "290.00 ₽", "1 080 ₽", "1 080,50 ₽"
 RX_MONEY_LINE = re.compile(r"^\d+(?:[ \u00a0]\d{3})*(?:[.,]\d+)?\s*₽$")
-
 RX_INT = re.compile(r"^\d+$")
 RX_ANY_RUB = re.compile(r"₽")
 
-# Любые габариты внутри строки: "8x16x418 мм", "8х16×418мм", "8×16×418 мм."
 RX_DIMS_ANYWHERE = re.compile(
     r"\s*\d{1,4}[xх×]\d{1,4}(?:[xх×]\d{1,5})?\s*мм\.?\s*",
     re.IGNORECASE,
@@ -39,17 +40,7 @@ def normalize_space(s: str) -> str:
     return s.strip()
 
 
-# -------------------------
-# Артикулы (из Art.xlsx)
-# -------------------------
 def normalize_key(name: str) -> str:
-    """
-    Нормализация для сопоставления с таблицей артикулов:
-    - нижний регистр
-    - пробелы
-    - унификация x/х/×
-    - убираем габариты '...мм' (на всякий случай)
-    """
     s = normalize_space(name).lower()
     s = s.replace("×", "x").replace("х", "x")
     s = RX_DIMS_ANYWHERE.sub(" ", s)
@@ -57,29 +48,42 @@ def normalize_key(name: str) -> str:
     return s
 
 
-def load_article_map() -> Dict[str, str]:
+def strip_dims_anywhere(name: str) -> str:
+    name = normalize_space(name)
+    name2 = RX_DIMS_ANYWHERE.sub(" ", name)
+    return normalize_space(name2)
+
+
+# -------------------------
+# Артикулы (Art.xlsx)
+# -------------------------
+def load_article_map() -> Tuple[Dict[str, str], str]:
     """
-    Ожидаем файл Art.xlsx (2 колонки): Товар | Артикул
-    Можно переопределить путь через env ART_XLSX_PATH.
+    Читает Art.xlsx (2 колонки): Товар | Артикул.
+    Можно переопределить путь env ART_XLSX_PATH.
     """
+    if openpyxl is None:
+        return {}, "openpyxl_not_installed"
+
     path = os.getenv("ART_XLSX_PATH", "Art.xlsx")
     if not os.path.exists(path):
-        # Если файла нет в репозитории — сервис всё равно работает, но без артикулов
-        return {}
+        return {}, f"file_not_found:{path}"
 
-    wb = openpyxl.load_workbook(path, data_only=True)
-    ws = wb[wb.sheetnames[0]]
+    try:
+        wb = openpyxl.load_workbook(path, data_only=True)
+        ws = wb[wb.sheetnames[0]]
+    except Exception as e:
+        return {}, f"cannot_open:{e}"
 
-    # Ищем заголовки (Товар, Артикул)
+    # Заголовки
     header = [normalize_space(ws.cell(1, c).value or "") for c in range(1, ws.max_column + 1)]
-    try:
-        товар_col = header.index("Товар") + 1
-    except ValueError:
-        товар_col = 1
-    try:
-        арт_col = header.index("Артикул") + 1
-    except ValueError:
-        арт_col = 2
+    товар_col = 1
+    арт_col = 2
+    for idx, h in enumerate(header, start=1):
+        if h.lower() == "товар":
+            товар_col = idx
+        if h.lower() == "артикул":
+            арт_col = idx
 
     m: Dict[str, str] = {}
     for r in range(2, ws.max_row + 1):
@@ -92,10 +96,11 @@ def load_article_map() -> Dict[str, str]:
         if not товар_s or not арт_s:
             continue
         m[normalize_key(товар_s)] = арт_s
-    return m
+
+    return m, "ok"
 
 
-ARTICLE_MAP: Dict[str, str] = load_article_map()
+ARTICLE_MAP, ARTICLE_MAP_STATUS = load_article_map()
 
 
 # -------------------------
@@ -160,13 +165,6 @@ def looks_like_money_or_qty(line: str) -> bool:
     return False
 
 
-def strip_dims_anywhere(name: str) -> str:
-    """Удаляет габариты вида '8x16x418 мм' даже если они в середине/конце строки."""
-    name = normalize_space(name)
-    name2 = RX_DIMS_ANYWHERE.sub(" ", name)
-    return normalize_space(name2)
-
-
 def clean_name_from_buffer(buf: List[str]) -> str:
     filtered = []
     for ln in buf:
@@ -174,7 +172,6 @@ def clean_name_from_buffer(buf: List[str]) -> str:
             continue
         filtered.append(ln)
 
-    # с конца убираем тех. строки: габариты/вес/деньги/кол-во
     while filtered and (looks_like_dim_or_weight(filtered[-1]) or looks_like_money_or_qty(filtered[-1])):
         filtered.pop()
 
@@ -186,14 +183,10 @@ def clean_name_from_buffer(buf: List[str]) -> str:
 
 
 def parse_items(pdf_bytes: bytes) -> Tuple[List[Tuple[str, int]], Dict]:
-    """
-    Парсер: money -> qty -> money.
-    Буфер НЕ сбрасываем на границе страниц => фикс стыка страниц.
-    """
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
 
-    ordered = OrderedDict()  # name -> qty
-    buf: List[str] = []      # НЕ сбрасываем на границе страниц
+    ordered = OrderedDict()
+    buf: List[str] = []
     in_totals = False
 
     stats = {
@@ -202,9 +195,8 @@ def parse_items(pdf_bytes: bytes) -> Tuple[List[Tuple[str, int]], Dict]:
         "int_lines": 0,
         "rub_lines": 0,
         "items_found": 0,
-        "money_examples": [],
-        "int_examples": [],
         "article_map_size": len(ARTICLE_MAP),
+        "article_map_status": ARTICLE_MAP_STATUS,
     }
 
     for page in doc:
@@ -216,12 +208,8 @@ def parse_items(pdf_bytes: bytes) -> Tuple[List[Tuple[str, int]], Dict]:
         for ln in lines:
             if RX_MONEY_LINE.fullmatch(ln):
                 stats["money_lines"] += 1
-                if len(stats["money_examples"]) < 5:
-                    stats["money_examples"].append(ln)
             if RX_INT.fullmatch(ln):
                 stats["int_lines"] += 1
-                if len(stats["int_examples"]) < 5:
-                    stats["int_examples"].append(ln)
             if RX_ANY_RUB.search(ln):
                 stats["rub_lines"] += 1
 
@@ -243,7 +231,6 @@ def parse_items(pdf_bytes: bytes) -> Tuple[List[Tuple[str, int]], Dict]:
                 i += 1
                 continue
 
-            # ЯКОРЬ: money -> qty -> money
             if RX_MONEY_LINE.fullmatch(line):
                 end = min(len(lines), i + 10)
 
@@ -276,10 +263,7 @@ def parse_items(pdf_bytes: bytes) -> Tuple[List[Tuple[str, int]], Dict]:
 
                 if name:
                     qty = int(lines[qty_idx])
-                    if name in ordered:
-                        ordered[name] += qty
-                    else:
-                        ordered[name] = qty
+                    ordered[name] = ordered.get(name, 0) + qty
                     stats["items_found"] += 1
 
                 i = sum_idx + 1
@@ -292,7 +276,7 @@ def parse_items(pdf_bytes: bytes) -> Tuple[List[Tuple[str, int]], Dict]:
 
 
 # -------------------------
-# CSV output
+# CSV output (comma-separated)
 # -------------------------
 def make_csv_cp1251(rows: List[Tuple[str, int]]) -> bytes:
     out = io.StringIO()
@@ -335,7 +319,7 @@ HOME_HTML = "\n".join([
     "<body>",
     "  <div class='card'>",
     "    <h1>PDF → CSV</h1>",
-    "    <p>Загрузите PDF и получите CSV: <b>Артикул</b> / <b>Товар</b> / <b>Кол-во</b> (порядок как в PDF).</p>",
+    "    <p>Загрузите PDF и получите CSV: <b>Артикул</b>, <b>Товар</b>, <b>Кол-во</b> (порядок как в PDF).</p>",
     "    <p class='hint'>CSV: кодировка <b>Windows-1251</b>, разделитель <b>,</b>. Артикулы берутся из <b>Art.xlsx</b>.</p>",
     "    <div class='row'>",
     "      <input id='pdf' type='file' accept='application/pdf,.pdf' />",
@@ -395,7 +379,11 @@ HOME_HTML = "\n".join([
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "article_map_size": len(ARTICLE_MAP)}
+    return {
+        "status": "ok",
+        "article_map_size": len(ARTICLE_MAP),
+        "article_map_status": ARTICLE_MAP_STATUS,
+    }
 
 
 @app.api_route("/", methods=["GET", "HEAD"], response_class=HTMLResponse)
