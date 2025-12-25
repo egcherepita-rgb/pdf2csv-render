@@ -15,7 +15,7 @@ except Exception:
     openpyxl = None
 
 
-app = FastAPI(title="PDF → CSV (артикул / товар / кол-во)", version="3.5.1")
+app = FastAPI(title="PDF → CSV (артикул / наименование / всего / категория)", version="3.5.3")
 
 # -------------------------
 # Regex (Render-safe)
@@ -58,10 +58,6 @@ def strip_dims_anywhere(name: str) -> str:
 # Артикулы (Art.xlsx)
 # -------------------------
 def load_article_map() -> Tuple[Dict[str, str], str]:
-    """
-    Читает Art.xlsx (2 колонки): Товар | Артикул.
-    Можно переопределить путь env ART_XLSX_PATH.
-    """
     if openpyxl is None:
         return {}, "openpyxl_not_installed"
 
@@ -75,7 +71,6 @@ def load_article_map() -> Tuple[Dict[str, str], str]:
     except Exception as e:
         return {}, f"cannot_open:{e}"
 
-    # Заголовки
     header = [normalize_space(ws.cell(1, c).value or "") for c in range(1, ws.max_column + 1)]
     товар_col = 1
     арт_col = 2
@@ -101,6 +96,9 @@ def load_article_map() -> Tuple[Dict[str, str], str]:
 
 
 ARTICLE_MAP, ARTICLE_MAP_STATUS = load_article_map()
+
+# Категория по требованию — всегда "2"
+CATEGORY_VALUE = 2
 
 
 # -------------------------
@@ -183,6 +181,10 @@ def clean_name_from_buffer(buf: List[str]) -> str:
 
 
 def parse_items(pdf_bytes: bytes) -> Tuple[List[Tuple[str, int]], Dict]:
+    """
+    Парсер: money -> qty -> money.
+    Буфер НЕ сбрасываем на границе страниц => фикс стыка страниц.
+    """
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
 
     ordered = OrderedDict()
@@ -231,6 +233,7 @@ def parse_items(pdf_bytes: bytes) -> Tuple[List[Tuple[str, int]], Dict]:
                 i += 1
                 continue
 
+            # ЯКОРЬ: money -> qty -> money
             if RX_MONEY_LINE.fullmatch(line):
                 end = min(len(lines), i + 10)
 
@@ -281,11 +284,13 @@ def parse_items(pdf_bytes: bytes) -> Tuple[List[Tuple[str, int]], Dict]:
 def make_csv_cp1251(rows: List[Tuple[str, int]]) -> bytes:
     out = io.StringIO()
     writer = csv.writer(out, delimiter=",", quotechar='"', quoting=csv.QUOTE_MINIMAL, lineterminator="\n")
-    writer.writerow(["Артикул", "Товар", "Кол-во"])
+
+    # Заголовки по требованию: Категория ПОСЛЕДНЯЯ
+    writer.writerow(["Артикул", "Наименование", "Всего", "Категория"])
 
     for name, qty in rows:
         art = ARTICLE_MAP.get(normalize_key(name), "")
-        writer.writerow([art, name, qty])
+        writer.writerow([art, name, qty, CATEGORY_VALUE])
 
     return out.getvalue().encode("cp1251", errors="replace")
 
@@ -319,8 +324,8 @@ HOME_HTML = "\n".join([
     "<body>",
     "  <div class='card'>",
     "    <h1>PDF → CSV</h1>",
-    "    <p>Загрузите PDF и получите CSV: <b>Артикул</b>, <b>Товар</b>, <b>Кол-во</b> (порядок как в PDF).</p>",
-    "    <p class='hint'>CSV: кодировка <b>Windows-1251</b>, разделитель <b>,</b>. Артикулы берутся из <b>Art.xlsx</b>.</p>",
+    "    <p>Выходной CSV: <b>Артикул</b>, <b>Наименование</b>, <b>Всего</b>, <b>Категория</b>.</p>",
+    "    <p class='hint'>Категория всегда = <b>2</b>. CSV: кодировка <b>Windows-1251</b>, разделитель <b>,</b>. Артикулы из <b>Art.xlsx</b>.</p>",
     "    <div class='row'>",
     "      <input id='pdf' type='file' accept='application/pdf,.pdf' />",
     "      <button id='btn' class='primary' disabled>Получить CSV</button>",
@@ -383,6 +388,7 @@ def health():
         "status": "ok",
         "article_map_size": len(ARTICLE_MAP),
         "article_map_status": ARTICLE_MAP_STATUS,
+        "category_value": CATEGORY_VALUE,
     }
 
 
