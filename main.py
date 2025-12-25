@@ -1,14 +1,17 @@
 import io
+import os
 import re
+import csv
 from collections import OrderedDict
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Optional
 
 import fitz  # PyMuPDF
+import openpyxl
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import Response, HTMLResponse
 
 
-app = FastAPI(title="PDF → CSV (товар / кол-во)", version="3.4.2")
+app = FastAPI(title="PDF → CSV (артикул / товар / кол-во)", version="3.5.0")
 
 # -------------------------
 # Regex (Render-safe)
@@ -36,6 +39,68 @@ def normalize_space(s: str) -> str:
     return s.strip()
 
 
+# -------------------------
+# Артикулы (из Art.xlsx)
+# -------------------------
+def normalize_key(name: str) -> str:
+    """
+    Нормализация для сопоставления с таблицей артикулов:
+    - нижний регистр
+    - пробелы
+    - унификация x/х/×
+    - убираем габариты '...мм' (на всякий случай)
+    """
+    s = normalize_space(name).lower()
+    s = s.replace("×", "x").replace("х", "x")
+    s = RX_DIMS_ANYWHERE.sub(" ", s)
+    s = normalize_space(s)
+    return s
+
+
+def load_article_map() -> Dict[str, str]:
+    """
+    Ожидаем файл Art.xlsx (2 колонки): Товар | Артикул
+    Можно переопределить путь через env ART_XLSX_PATH.
+    """
+    path = os.getenv("ART_XLSX_PATH", "Art.xlsx")
+    if not os.path.exists(path):
+        # Если файла нет в репозитории — сервис всё равно работает, но без артикулов
+        return {}
+
+    wb = openpyxl.load_workbook(path, data_only=True)
+    ws = wb[wb.sheetnames[0]]
+
+    # Ищем заголовки (Товар, Артикул)
+    header = [normalize_space(ws.cell(1, c).value or "") for c in range(1, ws.max_column + 1)]
+    try:
+        товар_col = header.index("Товар") + 1
+    except ValueError:
+        товар_col = 1
+    try:
+        арт_col = header.index("Артикул") + 1
+    except ValueError:
+        арт_col = 2
+
+    m: Dict[str, str] = {}
+    for r in range(2, ws.max_row + 1):
+        товар = ws.cell(r, товар_col).value
+        арт = ws.cell(r, арт_col).value
+        if not товар or not арт:
+            continue
+        товар_s = normalize_space(str(товар))
+        арт_s = normalize_space(str(арт))
+        if not товар_s or not арт_s:
+            continue
+        m[normalize_key(товар_s)] = арт_s
+    return m
+
+
+ARTICLE_MAP: Dict[str, str] = load_article_map()
+
+
+# -------------------------
+# PDF parsing
+# -------------------------
 def split_lines(page: fitz.Page) -> List[str]:
     txt = page.get_text("text") or ""
     lines = [normalize_space(x) for x in txt.splitlines()]
@@ -96,19 +161,13 @@ def looks_like_money_or_qty(line: str) -> bool:
 
 
 def strip_dims_anywhere(name: str) -> str:
-    """
-    Удаляет габариты вида '8x16x418 мм' даже если они:
-    - внутри строки
-    - с символом ×
-    - без пробела перед мм
-    """
+    """Удаляет габариты вида '8x16x418 мм' даже если они в середине/конце строки."""
     name = normalize_space(name)
     name2 = RX_DIMS_ANYWHERE.sub(" ", name)
     return normalize_space(name2)
 
 
 def clean_name_from_buffer(buf: List[str]) -> str:
-    # вычистим мусор
     filtered = []
     for ln in buf:
         if is_noise(ln) or is_header_token(ln) or is_totals_block(ln) or is_project_total_only(ln):
@@ -122,16 +181,13 @@ def clean_name_from_buffer(buf: List[str]) -> str:
     name = normalize_space(" ".join(filtered))
     name = re.sub(r"^Фото\s*", "", name, flags=re.IGNORECASE).strip()
     name = re.sub(r"^Товар\s*", "", name, flags=re.IGNORECASE).strip()
-
-    # КЛЮЧЕВОЕ: вырезаем габариты "…мм" даже если они в середине/конце строки
     name = strip_dims_anywhere(name)
-
     return name
 
 
 def parse_items(pdf_bytes: bytes) -> Tuple[List[Tuple[str, int]], Dict]:
     """
-    Главный парсер: money -> qty -> money.
+    Парсер: money -> qty -> money.
     Буфер НЕ сбрасываем на границе страниц => фикс стыка страниц.
     """
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
@@ -148,6 +204,7 @@ def parse_items(pdf_bytes: bytes) -> Tuple[List[Tuple[str, int]], Dict]:
         "items_found": 0,
         "money_examples": [],
         "int_examples": [],
+        "article_map_size": len(ARTICLE_MAP),
     }
 
     for page in doc:
@@ -234,17 +291,24 @@ def parse_items(pdf_bytes: bytes) -> Tuple[List[Tuple[str, int]], Dict]:
     return list(ordered.items()), stats
 
 
+# -------------------------
+# CSV output
+# -------------------------
 def make_csv_cp1251(rows: List[Tuple[str, int]]) -> bytes:
     out = io.StringIO()
-    out.write("Товар;Кол-во\n")
+    writer = csv.writer(out, delimiter=",", quotechar='"', quoting=csv.QUOTE_MINIMAL, lineterminator="\n")
+    writer.writerow(["Артикул", "Товар", "Кол-во"])
+
     for name, qty in rows:
-        safe = (name or "").replace('"', '""')
-        if ";" in safe or "\n" in safe:
-            safe = f'"{safe}"'
-        out.write(f"{safe};{qty}\n")
+        art = ARTICLE_MAP.get(normalize_key(name), "")
+        writer.writerow([art, name, qty])
+
     return out.getvalue().encode("cp1251", errors="replace")
 
 
+# -------------------------
+# UI
+# -------------------------
 HOME_HTML = "\n".join([
     "<!doctype html>",
     "<html lang='ru'>",
@@ -271,8 +335,8 @@ HOME_HTML = "\n".join([
     "<body>",
     "  <div class='card'>",
     "    <h1>PDF → CSV</h1>",
-    "    <p>Загрузите PDF и получите CSV: <b>Товар</b> / <b>Кол-во</b> (порядок как в PDF).</p>",
-    "    <p class='hint'>CSV: кодировка <b>Windows-1251</b>, разделитель <b>;</b>.</p>",
+    "    <p>Загрузите PDF и получите CSV: <b>Артикул</b> / <b>Товар</b> / <b>Кол-во</b> (порядок как в PDF).</p>",
+    "    <p class='hint'>CSV: кодировка <b>Windows-1251</b>, разделитель <b>,</b>. Артикулы берутся из <b>Art.xlsx</b>.</p>",
     "    <div class='row'>",
     "      <input id='pdf' type='file' accept='application/pdf,.pdf' />",
     "      <button id='btn' class='primary' disabled>Получить CSV</button>",
@@ -331,7 +395,7 @@ HOME_HTML = "\n".join([
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "article_map_size": len(ARTICLE_MAP)}
 
 
 @app.api_route("/", methods=["GET", "HEAD"], response_class=HTMLResponse)
